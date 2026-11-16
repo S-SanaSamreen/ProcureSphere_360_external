@@ -12,8 +12,54 @@ from .models import ApprovalAction, ApprovalDelegate
 from .services import process_approval_action_service, set_approval_delegate_service
 
 
+def _get_legal_contract_inbox_querysets(user):
+    """Retrieve organization-scoped contract queues relevant to Legal Manager reviews."""
+    import uuid
+
+    from apps.audit.models import AuditLog
+    from apps.contracts.models import Contract
+    from apps.contracts.selectors import (
+        get_contracts_pending_legal_review,
+        get_contracts_qs,
+    )
+
+    pending_qs = get_contracts_pending_legal_review(user=user)
+    raw_acted_ids = AuditLog.objects.filter(
+        actor=user,
+        target_model="Contract",
+        action__in=[AuditLog.ACTION_APPROVE, AuditLog.ACTION_REJECT],
+    ).values_list("target_object_id", flat=True)
+
+    acted_uuids = []
+    for raw_id in raw_acted_ids:
+        try:
+            acted_uuids.append(uuid.UUID(str(raw_id)))
+        except (ValueError, TypeError):
+            continue
+
+    history_statuses = [
+        Contract.STATUS_BUSINESS_APPROVAL,
+        Contract.STATUS_ACTIVE,
+        Contract.STATUS_RENEWAL_DUE,
+        Contract.STATUS_RENEWED,
+        Contract.STATUS_EXPIRED,
+        Contract.STATUS_TERMINATED,
+    ]
+    history_q = Q(status__in=history_statuses)
+    if acted_uuids:
+        history_q |= Q(id__in=acted_uuids)
+    history_qs = get_contracts_qs(user=user).filter(history_q).distinct()
+    return pending_qs, history_qs
+
+
 def _get_approval_querysets(user, role_code):
     """Retrieve base pending and history querysets scoped by role and department."""
+    if not getattr(user, "is_superuser", False) and role_code in [
+        Role.LEGAL_MGR,
+        Role.STORES_RECEIVER,
+    ]:
+        return PurchaseRequisition.objects.none(), PurchaseRequisition.objects.none()
+
     pending_statuses = ["SUBMITTED", "MANAGER_REVIEW", "BUDGET_REVIEW"]
     history_statuses = ["APPROVED", "REJECTED", "SOURCING", "PO_ISSUED"]
 
@@ -26,7 +72,7 @@ def _get_approval_querysets(user, role_code):
     user_approved_pr_ids = ApprovalAction.objects.filter(
         actor=user,
         target_model_name="PurchaseRequisition",
-        action=ApprovalAction.ACTION_APPROVE,
+        action__in=[ApprovalAction.ACTION_APPROVE, ApprovalAction.ACTION_REJECT],
     ).values_list("target_object_id", flat=True)
 
     if role_code == Role.DEPT_APPROVER:
@@ -46,8 +92,26 @@ def _get_approval_querysets(user, role_code):
                     organization=user.organization
                 ).first()
 
+        user_org = getattr(user, "organization", None) or (
+            user_dept.organization if user_dept else None
+        )
         if user_dept:
-            q = Q(department=user_dept) | Q(cost_center__manager=user)
+            from apps.organization.models import Department
+
+            depts_with_approvers = Department.objects.filter(
+                organization=user_org,
+                users__role__code=Role.DEPT_APPROVER,
+                users__is_active=True,
+            ).exclude(id=user_dept.id)
+
+            q = (
+                Q(department=user_dept)
+                | Q(cost_center__manager=user)
+                | (
+                    Q(department__organization=user_org)
+                    & ~Q(department__in=depts_with_approvers)
+                )
+            )
             pending_qs = PurchaseRequisition.objects.filter(
                 q, status__in=pending_statuses
             ).exclude(id__in=user_approved_pr_ids).distinct()
@@ -55,8 +119,8 @@ def _get_approval_querysets(user, role_code):
                 q & (Q(status__in=history_statuses) | Q(id__in=user_approved_pr_ids))
             ).distinct()
             return pending_qs, history_qs
-        elif getattr(user, "organization", None):
-            q = Q(department__organization=user.organization) | Q(
+        elif user_org:
+            q = Q(department__organization=user_org) | Q(
                 cost_center__manager=user
             )
             pending_qs = PurchaseRequisition.objects.filter(
@@ -77,7 +141,9 @@ def _get_approval_querysets(user, role_code):
 
     return (
         PurchaseRequisition.objects.filter(status__in=pending_statuses),
-        PurchaseRequisition.objects.filter(status__in=history_statuses),
+        PurchaseRequisition.objects.filter(
+            Q(status__in=history_statuses) | Q(id__in=user_approved_pr_ids)
+        ).distinct(),
     )
 
 
@@ -115,6 +181,16 @@ def _handle_approval_post(request, role_code):
         messages.error(
             request,
             "Permission Denied: Compliance Auditors hold strictly read-only permissions and cannot approve or reject requisitions.",
+        )
+        return redirect("approvals_inbox")
+    if not request.user.is_superuser and role_code in [
+        Role.LEGAL_MGR,
+        Role.STORES_RECEIVER,
+        Role.REQUESTER,
+    ]:
+        messages.error(
+            request,
+            "Permission Denied: Your role is not authorized to approve or reject purchase requisitions.",
         )
         return redirect("approvals_inbox")
 
@@ -166,67 +242,255 @@ def approvals_inbox_view(request):
     search_q = request.GET.get("q", "").strip()
     status_filter = request.GET.get("status", "").strip()
 
-    pending_prs, history_prs = _get_approval_querysets(user, role_code)
-
-    if search_q:
-        q_filter = (
-            Q(pr_number__icontains=search_q)
-            | Q(title__icontains=search_q)
-            | Q(requester__email__icontains=search_q)
-            | Q(department__name__icontains=search_q)
-        )
-        pending_prs = pending_prs.filter(q_filter)
-        history_prs = history_prs.filter(q_filter)
-
-    valid_pending_statuses = ["SUBMITTED", "MANAGER_REVIEW", "BUDGET_REVIEW"]
-    valid_history_statuses = ["APPROVED", "REJECTED", "SOURCING", "PO_ISSUED"]
-
-    if status_filter:
-        if tab == "history":
-            if status_filter in valid_history_statuses:
-                history_prs = history_prs.filter(status=status_filter)
-            else:
-                status_filter = ""
-        else:
-            if status_filter in valid_pending_statuses:
-                pending_prs = pending_prs.filter(status=status_filter)
-            else:
-                status_filter = ""
-
-    pending_prs = pending_prs.order_by("-updated_at")
-    history_prs = history_prs.order_by("-updated_at")
-
-    pending_count = pending_prs.count()
-    has_budget_overrun = pending_prs.filter(status="BUDGET_REVIEW").exists()
-
+    is_legal_inbox = bool(not user.is_superuser and role_code == Role.LEGAL_MGR)
     query_params = request.GET.copy()
     if "page" in query_params:
         query_params.pop("page")
     querystring = query_params.urlencode()
-
     page_number = request.GET.get("page")
-    if tab == "history":
-        history_paginator = Paginator(history_prs, 10)
-        page_obj = history_paginator.get_page(page_number)
-        history_display = page_obj
-        pending_display = pending_prs
+
+    if is_legal_inbox:
+        from apps.contracts.models import Contract
+
+        legal_pending, legal_history = _get_legal_contract_inbox_querysets(user)
+        if search_q:
+            c_filter = (
+                Q(contract_number__icontains=search_q)
+                | Q(title__icontains=search_q)
+                | Q(vendor__legal_name__icontains=search_q)
+            )
+            legal_pending = legal_pending.filter(c_filter)
+            legal_history = legal_history.filter(c_filter)
+
+        valid_legal_history = [
+            Contract.STATUS_BUSINESS_APPROVAL,
+            Contract.STATUS_ACTIVE,
+            Contract.STATUS_DRAFT,
+            Contract.STATUS_RENEWAL_DUE,
+            Contract.STATUS_RENEWED,
+            Contract.STATUS_EXPIRED,
+            Contract.STATUS_TERMINATED,
+        ]
+        if status_filter:
+            if tab == "history":
+                if status_filter in valid_legal_history:
+                    legal_history = legal_history.filter(status=status_filter)
+                else:
+                    status_filter = ""
+            else:
+                if status_filter == Contract.STATUS_LEGAL_REVIEW:
+                    legal_pending = legal_pending.filter(status=status_filter)
+                else:
+                    status_filter = ""
+
+        legal_pending = legal_pending.order_by("-updated_at")
+        legal_history = legal_history.order_by("-updated_at")
+        pending_count = legal_pending.count()
+
+        if tab == "history":
+            page_obj = Paginator(legal_history, 10).get_page(page_number)
+            legal_history_display = page_obj
+            legal_pending_display = legal_pending
+        else:
+            page_obj = Paginator(legal_pending, 10).get_page(page_number)
+            legal_pending_display = page_obj
+            legal_history_display = legal_history
+
+        pending_display = PurchaseRequisition.objects.none()
+        history_display = PurchaseRequisition.objects.none()
+        has_budget_overrun = False
     else:
-        pending_paginator = Paginator(pending_prs, 10)
-        page_obj = pending_paginator.get_page(page_number)
-        pending_display = page_obj
-        history_display = history_prs
+        pending_prs, history_prs = _get_approval_querysets(user, role_code)
+
+        if search_q:
+            q_filter = (
+                Q(pr_number__icontains=search_q)
+                | Q(title__icontains=search_q)
+                | Q(requester__email__icontains=search_q)
+                | Q(department__name__icontains=search_q)
+            )
+            pending_prs = pending_prs.filter(q_filter)
+            history_prs = history_prs.filter(q_filter)
+
+        valid_pending_statuses = [
+            "PENDING",
+            "SUBMITTED",
+            "MANAGER_REVIEW",
+            "BUDGET_REVIEW",
+        ]
+        valid_history_statuses = [
+            "APPROVED",
+            "REJECTED",
+            "PENDING",
+            "MANAGER_REVIEW",
+            "SUBMITTED",
+            "BUDGET_REVIEW",
+            "SOURCING",
+            "PO_ISSUED",
+        ]
+
+        if status_filter:
+            if tab == "history":
+                if status_filter == "PENDING":
+                    history_prs = history_prs.filter(
+                        status__in=[
+                            PurchaseRequisition.STATUS_SUBMITTED,
+                            PurchaseRequisition.STATUS_MANAGER_REVIEW,
+                            PurchaseRequisition.STATUS_BUDGET_REVIEW,
+                        ]
+                    )
+                elif status_filter in valid_history_statuses:
+                    history_prs = history_prs.filter(status=status_filter)
+                else:
+                    status_filter = ""
+            else:
+                if status_filter == "PENDING":
+                    pending_prs = pending_prs.filter(
+                        status__in=[
+                            PurchaseRequisition.STATUS_SUBMITTED,
+                            PurchaseRequisition.STATUS_MANAGER_REVIEW,
+                            PurchaseRequisition.STATUS_BUDGET_REVIEW,
+                        ]
+                    )
+                elif status_filter in valid_pending_statuses:
+                    pending_prs = pending_prs.filter(status=status_filter)
+                else:
+                    status_filter = ""
+
+        pending_prs = pending_prs.order_by("-updated_at")
+        history_prs = history_prs.order_by("-updated_at")
+
+        pending_count = pending_prs.count()
+        has_budget_overrun = pending_prs.filter(status="BUDGET_REVIEW").exists()
+
+        if tab == "history":
+            history_paginator = Paginator(history_prs, 10)
+            page_obj = history_paginator.get_page(page_number)
+            history_display = page_obj
+            pending_display = pending_prs
+        else:
+            pending_paginator = Paginator(pending_prs, 10)
+            page_obj = pending_paginator.get_page(page_number)
+            pending_display = page_obj
+            history_display = history_prs
+
+            # Annotate inline approval eligibility and budget overrun status without altering routing rules
+            from apps.approvals.models import ApprovalPolicy
+            from apps.approvals.services import evaluate_approval_chain
+            from apps.budgets.models import Budget
+
+            today_date = timezone.now().date()
+            pending_items = list(page_obj.object_list)
+            cc_ids = [pr.cost_center_id for pr in pending_items if pr.cost_center_id]
+            active_budgets = {}
+            if cc_ids:
+                for b in Budget.objects.filter(
+                    cost_center_id__in=cc_ids,
+                    fiscal_period__start_date__lte=today_date,
+                    fiscal_period__end_date__gte=today_date,
+                    fiscal_period__is_closed=False,
+                ).order_by("-fiscal_period__start_date"):
+                    active_budgets.setdefault(b.cost_center_id, b)
+                missing_cc_ids = [cid for cid in cc_ids if cid not in active_budgets]
+                if missing_cc_ids:
+                    for b in Budget.objects.filter(
+                        cost_center_id__in=missing_cc_ids,
+                        fiscal_period__is_closed=False,
+                    ).order_by("-fiscal_period__start_date"):
+                        active_budgets.setdefault(b.cost_center_id, b)
+
+            is_restricted_role = not user.is_superuser and role_code in [
+                Role.AUDITOR,
+                Role.LEGAL_MGR,
+                Role.STORES_RECEIVER,
+                Role.REQUESTER,
+            ]
+            for pr in pending_items:
+                b = active_budgets.get(pr.cost_center_id)
+                pr.is_over_budget = bool(
+                    pr.status == PurchaseRequisition.STATUS_BUDGET_REVIEW
+                    or (b is not None and (b.available_amount <= 0 or pr.total_amount > b.available_amount))
+                )
+                can_decide = False
+                if not is_restricted_role and pr.status == PurchaseRequisition.STATUS_BUDGET_REVIEW:
+                    if user.is_superuser or role_code in [Role.FINANCE_AP, Role.PROC_MGR, Role.SUPER_ADMIN]:
+                        can_decide = True
+                elif not is_restricted_role and pr.status in [
+                    PurchaseRequisition.STATUS_SUBMITTED,
+                    PurchaseRequisition.STATUS_MANAGER_REVIEW,
+                ] and not (pr.is_over_budget and role_code == Role.DEPT_APPROVER):
+                    if user.is_superuser:
+                        can_decide = True
+                    else:
+                        pr_org = (
+                            getattr(getattr(pr, "department", None), "organization", None)
+                            or getattr(getattr(getattr(pr, "cost_center", None), "department", None), "organization", None)
+                            or getattr(pr.requester, "effective_organization", None)
+                        )
+                        chain = evaluate_approval_chain(
+                            module=ApprovalPolicy.MODULE_PR,
+                            amount=pr.total_amount,
+                            department=pr.department,
+                            cost_center=pr.cost_center,
+                            organization=pr_org,
+                        )
+                        step_idx = ApprovalAction.objects.filter(
+                            target_object_id=str(pr.id),
+                            target_model_name="PurchaseRequisition",
+                            action=ApprovalAction.ACTION_APPROVE,
+                        ).count()
+                        if chain and step_idx < len(chain):
+                            step_info = chain[step_idx]
+                            req_role = step_info["approver_role"]
+                            spec_app = step_info["specific_approver"]
+                            eff_app = step_info["effective_approver"]
+                            if spec_app:
+                                can_decide = user == eff_app or user == spec_app
+                            else:
+                                approver_role_code = getattr(getattr(user, "role", None), "code", None)
+                                if (getattr(user, "role_id", None) == req_role.id) or (approver_role_code == req_role.code):
+                                    pr_dept = pr.department or (
+                                        pr.cost_center.department if pr.cost_center else None
+                                    )
+                                    if req_role.code == Role.DEPT_APPROVER and pr_dept and user.department:
+                                        has_own_approver = (
+                                            User.objects.filter(
+                                                role__code=Role.DEPT_APPROVER,
+                                                department=pr_dept,
+                                                is_active=True,
+                                            )
+                                            .exclude(id=user.id)
+                                            .exists()
+                                        )
+                                        can_decide = (
+                                            user.department == pr_dept
+                                            or (pr.cost_center and user == pr.cost_center.manager)
+                                            or not has_own_approver
+                                        )
+                                    else:
+                                        can_decide = True
+                        elif not chain and role_code in [Role.DEPT_APPROVER, Role.SUPER_ADMIN]:
+                            can_decide = True
+                pr.can_inline_decide = can_decide
+
+        legal_pending_display = []
+        legal_history_display = []
 
     base_layout = _get_base_layout(request.user, role_code)
 
     context = {
         "pending_prs": pending_display,
         "history_prs": history_display,
+        "legal_pending_contracts": legal_pending_display,
+        "legal_history_contracts": legal_history_display,
+        "is_legal_inbox": is_legal_inbox,
         "page_obj": page_obj,
         "querystring": querystring,
         "pending_count": pending_count,
         "active_tab": tab,
         "role_code": role_code,
         "base_layout": base_layout,
+        "active_nav": "my_approvals" if tab == "history" else "pending_approvals",
         "search_q": search_q,
         "status_filter": status_filter,
         "has_budget_overrun": has_budget_overrun,

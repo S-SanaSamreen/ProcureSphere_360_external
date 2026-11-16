@@ -46,12 +46,18 @@ class CanManagePurchaseOrder(BasePermission):
         if not request.user or not request.user.is_authenticated:
             return False
 
-        if getattr(request.user, "role_code", None) == Role.AUDITOR:
+        role_code = getattr(request.user, "role_code", None) or (
+            request.user.role.code if getattr(request.user, "role", None) else None
+        )
+        if not request.user.is_superuser and role_code == Role.STORES_RECEIVER:
+            return False
+
+        if role_code == Role.AUDITOR:
             return request.method in SAFE_METHODS
 
         is_vendor = (
             getattr(request.user, "is_vendor", False)
-            or getattr(request.user, "role_code", None) == Role.VENDOR_USER
+            or role_code == Role.VENDOR_USER
         )
 
         if is_vendor:
@@ -61,7 +67,7 @@ class CanManagePurchaseOrder(BasePermission):
                 return True
             return False
 
-        if getattr(request.user, "role_code", None) == Role.REQUESTER:
+        if role_code == Role.REQUESTER:
             return request.method in SAFE_METHODS
 
         if request.method in SAFE_METHODS:
@@ -82,6 +88,8 @@ class POLineSerializer(serializers.ModelSerializer):
     def validate_unit_price(self, value):
         if value < Decimal("0.00"):
             raise serializers.ValidationError("Unit price cannot be negative.")
+        if value.as_tuple().exponent < -2:
+            raise serializers.ValidationError("Unit price cannot have more than 2 decimal places.")
         return value
 
     def validate_quantity(self, value):
@@ -284,9 +292,38 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         vendor = attrs.get("vendor", getattr(self.instance, "vendor", None))
         if vendor and vendor.status != Vendor.STATUS_ACTIVE:
+            if vendor.status == Vendor.STATUS_SUSPENDED:
+                raise serializers.ValidationError(
+                    {"vendor": [f"Cannot create Purchase Order: Vendor '{vendor.legal_name}' is not ACTIVE (current status: SUSPENDED). POs cannot be issued to suspended vendors."]}
+                )
             raise serializers.ValidationError(
                 {"vendor": [f"Cannot create Purchase Order: Vendor '{vendor.legal_name}' is not ACTIVE (current status: {vendor.status})."]}
             )
+
+        # A PO can only be created from an APPROVED requisition
+        requisition = attrs.get("requisition", getattr(self.instance, "requisition", None))
+        if requisition and requisition.status not in ("APPROVED", "SOURCING"):
+            raise serializers.ValidationError(
+                {"requisition": [f"Cannot create Purchase Order from requisition '{requisition.pr_number}': Requisition status is '{requisition.status}' (must be APPROVED)."]}
+            )
+
+        # A PO can only be created from an AWARDED sourcing event
+        sourcing_event = attrs.get("sourcing_event", getattr(self.instance, "sourcing_event", None))
+        if sourcing_event and sourcing_event.status != SourcingEvent.STATUS_AWARDED:
+            raise serializers.ValidationError(
+                {"sourcing_event": [f"Cannot create Purchase Order from sourcing event '{sourcing_event.event_number}': Sourcing event status is '{sourcing_event.status}' (must be AWARDED)."]}
+            )
+
+        po_num = attrs.get("po_number") or self.initial_data.get("po_number")
+        if po_num and str(po_num).strip():
+            clean_po = str(po_num).strip()
+            qs_po = PurchaseOrder.objects.filter(po_number__iexact=clean_po)
+            if self.instance:
+                qs_po = qs_po.exclude(pk=self.instance.pk)
+            if qs_po.exists():
+                raise serializers.ValidationError(
+                    {"po_number": [f"Purchase Order with number '{clean_po}' already exists."]}
+                )
 
         if self.instance is None:
             lines_data = self.initial_data.get("lines")
@@ -296,14 +333,26 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
                 )
             for idx, line_item in enumerate(lines_data):
                 if isinstance(line_item, dict):
+                    desc = str(line_item.get("item_description", "")).strip()
+                    if not desc:
+                        raise serializers.ValidationError(
+                            {"lines": [f"Item description is required for line item {idx + 1}."]}
+                        )
                     price = line_item.get("unit_price")
                     if price is not None:
                         try:
-                            if Decimal(str(price)) < Decimal("0.00"):
+                            d_price = Decimal(str(price))
+                            if d_price < Decimal("0.00"):
                                 raise serializers.ValidationError(
                                     {"lines": [f"Unit price cannot be negative for line item {idx + 1}."]}
                                 )
-                        except (TypeError, ValueError, ArithmeticError):
+                            if d_price.as_tuple().exponent < -2:
+                                raise serializers.ValidationError(
+                                    {"lines": [f"Unit price cannot have more than 2 decimal places for line item {idx + 1}."]}
+                                )
+                        except (TypeError, ValueError, ArithmeticError) as e:
+                            if isinstance(e, serializers.ValidationError):
+                                raise
                             raise serializers.ValidationError(
                                 {"lines": [f"Invalid unit price for line item {idx + 1}."]}
                             )
@@ -322,28 +371,34 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
 
 
     def create(self, validated_data):
-        if not validated_data.get("po_number"):
-            from apps.core.services import generate_document_number
-            validated_data["po_number"] = generate_document_number(PurchaseOrder, "po_number", "PO")
-        lines_data = self.initial_data.get("lines", [])
-        po = super().create(validated_data)
-        if lines_data and isinstance(lines_data, list):
-            subtotal = Decimal("0.00")
-            for item in lines_data:
-                line = POLine.objects.create(
-                    po=po,
-                    item_description=item.get("item_description", "Item"),
-                    quantity=Decimal(str(item.get("quantity", "1"))),
-                    unit_price=Decimal(str(item.get("unit_price", "0.00"))),
-                    unit_of_measure=item.get("unit_of_measure", "EA"),
+        from django.db import transaction
+
+        with transaction.atomic():
+            if not validated_data.get("po_number"):
+                from apps.core.services import generate_document_number
+
+                validated_data["po_number"] = generate_document_number(
+                    PurchaseOrder, "po_number", "PO"
                 )
-                subtotal += line.line_total
-            tax = subtotal * Decimal("0.10")
-            po.subtotal = subtotal
-            po.tax_amount = tax
-            po.total_amount = subtotal + tax
-            po.save(update_fields=["subtotal", "tax_amount", "total_amount"])
-        return po
+            lines_data = self.initial_data.get("lines", [])
+            po = super().create(validated_data)
+            if lines_data and isinstance(lines_data, list):
+                subtotal = Decimal("0.00")
+                for item in lines_data:
+                    line = POLine.objects.create(
+                        po=po,
+                        item_description=item.get("item_description", "Item"),
+                        quantity=Decimal(str(item.get("quantity", "1"))),
+                        unit_price=Decimal(str(item.get("unit_price", "0.00"))),
+                        unit_of_measure=item.get("unit_of_measure", "EA"),
+                    )
+                    subtotal += line.line_total
+                tax = subtotal * Decimal("0.10")
+                po.subtotal = subtotal
+                po.tax_amount = tax
+                po.total_amount = subtotal + tax
+                po.save(update_fields=["subtotal", "tax_amount", "total_amount"])
+            return po
 
     def get_vendor_risk_level(self, obj):
         latest_risk = obj.vendor.risk_records.order_by("-created_at").first()
@@ -432,6 +487,26 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         "lines__item_description",
     ]
     ordering_fields = ["created_at", "total_amount", "po_number", "version", "status"]
+
+    def create(self, request, *args, **kwargs):
+        from django.db import IntegrityError, transaction
+        try:
+            with transaction.atomic():
+                return super().create(request, *args, **kwargs)
+        except IntegrityError as exc:
+            err_msg = str(exc).lower()
+            if "po_number" in err_msg or "orders_purchaseorder" in err_msg or "unique" in err_msg:
+                return Response(
+                    {
+                        "error": {
+                            "code": "DUPLICATE_RESOURCE",
+                            "message": "A Purchase Order with this PO number already exists or concurrent creation collided. Please retry.",
+                            "details": {"po_number": ["Purchase Order with this PO number already exists."]},
+                        }
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+            raise
 
     def get_queryset(self):
         user = self.request.user
@@ -709,15 +784,40 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         return Response(self.get_serializer(po).data, status=status.HTTP_201_CREATED)
 
     def _run_lifecycle_action(self, fn, *args, **kwargs):
+        from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
+        from rest_framework.exceptions import PermissionDenied as DRFPermissionDenied
         try:
             po = fn(*args, **kwargs)
+        except (DjangoPermissionDenied, DRFPermissionDenied) as e:
+            return Response(
+                {
+                    "error": {
+                        "code": "PERMISSION_DENIED",
+                        "message": str(e),
+                        "details": [str(e)],
+                    }
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
         except ValidationError as e:
             msg = e.messages if hasattr(e, "messages") else [str(e)]
+            first_msg = msg[0] if isinstance(msg, list) else str(e)
+            if "permission denied" in first_msg.lower():
+                return Response(
+                    {
+                        "error": {
+                            "code": "PERMISSION_DENIED",
+                            "message": first_msg,
+                            "details": msg,
+                        }
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
             return Response(
                 {
                     "error": {
                         "code": "VALIDATION_ERROR",
-                        "message": msg[0] if isinstance(msg, list) else str(e),
+                        "message": first_msg,
                         "details": msg,
                     }
                 },
@@ -745,7 +845,8 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="issue")
     def issue(self, request, pk=None):
         """APPROVED -> ISSUED. Notifies the vendor and requester."""
-        po = self.get_object()
+        base_qs = scope_purchase_orders_queryset(self.queryset, request.user)
+        po = get_object_or_404(base_qs, pk=pk)
         return self._run_lifecycle_action(
             issue_purchase_order_service, po=po, actor=request.user
         )
@@ -844,6 +945,23 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
 
         raw_lines = request.data.get("lines")
         if raw_lines and isinstance(raw_lines, list):
+            for idx, line in enumerate(raw_lines):
+                if not isinstance(line, dict):
+                    return Response({"error": {"code": "VALIDATION_ERROR", "message": f"Line {idx+1} must be an object."}}, status=status.HTTP_400_BAD_REQUEST)
+                if not line.get("item_description"):
+                    return Response({"error": {"code": "VALIDATION_ERROR", "message": f"Line {idx+1} is missing item_description."}}, status=status.HTTP_400_BAD_REQUEST)
+                qty = line.get("quantity")
+                price = line.get("unit_price")
+                try:
+                    from decimal import Decimal, InvalidOperation
+                    d_qty = Decimal(str(qty))
+                    d_price = Decimal(str(price))
+                    if d_qty <= 0:
+                        return Response({"error": {"code": "VALIDATION_ERROR", "message": f"Line {idx+1} quantity must be greater than zero."}}, status=status.HTTP_400_BAD_REQUEST)
+                    if d_price < 0:
+                        return Response({"error": {"code": "VALIDATION_ERROR", "message": f"Line {idx+1} unit price cannot be negative."}}, status=status.HTTP_400_BAD_REQUEST)
+                except (InvalidOperation, TypeError, ValueError):
+                    return Response({"error": {"code": "VALIDATION_ERROR", "message": f"Line {idx+1} has invalid quantity or unit price."}}, status=status.HTTP_400_BAD_REQUEST)
             lines = raw_lines
         else:
             lines = [
@@ -868,6 +986,9 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                     "message": f"PO Amendment #{amendment.amendment_number} submitted and pending manager approval.",
                     "amendment": POAmendmentSerializer(amendment).data,
                     "purchase_order": self.get_serializer(po).data,
+                    "version": po.version,
+                    "amendments_count": po.amendments.count(),
+                    "amendments": POAmendmentSerializer(po.amendments.all(), many=True).data,
                 },
                 status=status.HTTP_200_OK,
             )

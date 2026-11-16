@@ -1,3 +1,4 @@
+import logging
 from decimal import Decimal
 
 from django.core.exceptions import ValidationError
@@ -7,7 +8,27 @@ from django.utils import timezone
 
 from apps.accounts.models import Role, User
 from apps.audit.models import AuditLog
+from apps.notifications.models import Notification
 from apps.orders.models import POLine, PurchaseOrder
+
+logger = logging.getLogger(__name__)
+
+
+def _is_eligible_grn_recipient(user, grn_org=None) -> bool:
+    """
+    Validates whether a user is eligible to receive a Goods Receipt Note notification:
+    - User must be non-null and active (is_active=True).
+    - User must belong to the same organization/tenant as the GRN (if org is resolved).
+    """
+    if not user or not getattr(user, "is_active", False):
+        return False
+    if grn_org is not None:
+        user_org = getattr(user, "effective_organization", None) or getattr(user, "organization", None)
+        if user_org is not None and getattr(user_org, "id", user_org) != getattr(grn_org, "id", grn_org):
+            return False
+        if getattr(user, "organization_id", None) and str(user.organization_id) != str(getattr(grn_org, "id", grn_org)):
+            return False
+    return True
 
 from .models import (
     GoodsReceipt,
@@ -27,7 +48,8 @@ def _validate_and_create_receipt_line(
     received_by: User,
     item: dict,
 ) -> None:
-    po_line_id = item.get("po_line_id") or (item["po_line"].id if "po_line" in item else None)
+    po_line_val = item.get("po_line_id") or item.get("po_line")
+    po_line_id = po_line_val.id if hasattr(po_line_val, "id") else po_line_val
     if not po_line_id:
         raise ValidationError("Invalid receipt line: missing PO line reference.")
 
@@ -80,7 +102,35 @@ def _validate_and_create_receipt_line(
             f"Quantity accepted ({qty_accepted}) cannot exceed quantity received ({qty_received}) for '{po_line.item_description}'."
         )
 
-    qty_rejected = qty_received - qty_accepted
+    raw_rejected = item.get("quantity_rejected") or item.get("rejected")
+    if raw_rejected is not None and str(raw_rejected).strip() != "":
+        try:
+            qty_rejected = Decimal(str(raw_rejected))
+        except Exception:
+            raise ValidationError(
+                f"Quantity rejected for '{po_line.item_description}' must be a valid numeric value."
+            )
+        if qty_rejected < Decimal("0.00"):
+            raise ValidationError(
+                f"Quantity rejected for '{po_line.item_description}' cannot be negative."
+            )
+        if qty_accepted + qty_rejected > qty_received:
+            raise ValidationError(
+                f"Accepted quantity ({qty_accepted}) plus rejected quantity ({qty_rejected}) cannot exceed received quantity ({qty_received}) for '{po_line.item_description}'."
+            )
+    else:
+        qty_rejected = qty_received - qty_accepted
+
+    rej_reason = (
+        item.get("rejection_reason")
+        or item.get("reason")
+        or item.get("notes")
+        or ""
+    ).strip()
+    if qty_rejected > Decimal("0.00") and not rej_reason:
+        raise ValidationError(
+            f"Rejection reason is required when rejected quantity is greater than 0 for '{po_line.item_description}'."
+        )
 
     line = ReceiptLine.objects.create(
         receipt=receipt,
@@ -88,7 +138,7 @@ def _validate_and_create_receipt_line(
         quantity_received=qty_received,
         quantity_accepted=qty_accepted,
         quantity_rejected=qty_rejected,
-        notes=item.get("notes", ""),
+        notes=rej_reason or item.get("notes", ""),
     )
 
     if "inspection_notes" in item:
@@ -103,7 +153,7 @@ def _validate_and_create_receipt_line(
         RejectionRecord.objects.create(
             receipt_line=line,
             rejected_quantity=qty_rejected,
-            rejection_reason=item.get("rejection_reason", "Quality non-conformance"),
+            rejection_reason=rej_reason or "Quality non-conformance",
         )
 
     po_line.quantity_received = current_received + qty_accepted
@@ -156,6 +206,7 @@ def create_goods_receipt_service(
     receipt_items: list,
     delivery_note_number: str = "",
     remarks: str = "",
+    grn_number: str = None,
 ) -> GoodsReceipt:
     """
     Records a Goods Receipt Note (GRN) against a Purchase Order.
@@ -180,10 +231,18 @@ def create_goods_receipt_service(
     ]:
         raise ValidationError(f"Cannot record goods receipt against PO in status '{po.status}'.")
 
-    from apps.core.services import generate_document_number
-    from apps.notifications.models import Notification
+    if grn_number and str(grn_number).strip():
+        grn_number = str(grn_number).strip()
+        if GoodsReceipt.objects.filter(grn_number__iexact=grn_number).exists():
+            raise ValidationError(f"Goods receipt with GRN number '{grn_number}' already exists.")
+    else:
+        from apps.core.services import generate_document_number
+        grn_number = generate_document_number(GoodsReceipt, "grn_number", "GRN")
 
-    grn_number = generate_document_number(GoodsReceipt, "grn_number", "GRN")
+    if delivery_note_number and str(delivery_note_number).strip():
+        clean_dn = str(delivery_note_number).strip()
+        if GoodsReceipt.objects.filter(po=po, delivery_note_number__iexact=clean_dn).exists():
+            raise ValidationError(f"A goods receipt with delivery note '{clean_dn}' already exists for Purchase Order {po.po_number}.")
 
     receipt = GoodsReceipt.objects.create(
         grn_number=grn_number,
@@ -216,14 +275,65 @@ def create_goods_receipt_service(
         },
     )
 
+    # DEF-012: Goods Receipt Notification with tenant-scoped candidate priority and fallbacks
+    grn_org = resolve_grn_organization(receipt)
+    recipient = None
+
+    # Priority 1: Standard candidate list in priority order
+    standard_candidates = []
     if po.requisition and po.requisition.requester:
-        Notification.objects.create(
-            recipient=po.requisition.requester,
-            notification_type=Notification.TYPE_GOODS_RECEIVED,
-            title=f"Goods Receipt Recorded: {receipt.grn_number}",
-            message=f"Goods/services have been received under receipt {receipt.grn_number} for PO {po.po_number}.",
-            target_url=f"/receipts/{receipt.id}/",
-        )
+        standard_candidates.append(po.requisition.requester)
+    if getattr(po, "issued_by", None):
+        standard_candidates.append(po.issued_by)
+    if getattr(po, "submitted_by", None):
+        standard_candidates.append(po.submitted_by)
+    if getattr(po, "approved_by", None):
+        standard_candidates.append(po.approved_by)
+
+    for cand in standard_candidates:
+        if _is_eligible_grn_recipient(cand, grn_org):
+            recipient = cand
+            break
+
+    # Priority 2: Fallback to Purchase Order creator
+    if not recipient and getattr(po, "created_by", None):
+        if _is_eligible_grn_recipient(po.created_by, grn_org):
+            recipient = po.created_by
+
+    # Priority 3: Fallback to active Procurement Manager belonging to the same organization
+    if not recipient:
+        if grn_org:
+            pm = _org_scoped_internal_users([Role.PROC_MGR], org=grn_org).filter(is_active=True).first()
+        else:
+            pm = User.objects.filter(role__code=Role.PROC_MGR, is_active=True).first()
+        if pm and _is_eligible_grn_recipient(pm, grn_org):
+            recipient = pm
+
+    # Non-blocking notification dispatch with duplicate prevention
+    if recipient:
+        try:
+            duplicate_exists = Notification.objects.filter(
+                recipient=recipient,
+                notification_type=Notification.TYPE_GOODS_RECEIVED,
+            ).filter(
+                Q(title__contains=receipt.grn_number)
+                | Q(target_url=f"/receipts/{receipt.id}/")
+                | Q(message__contains=receipt.grn_number)
+            ).exists()
+
+            if not duplicate_exists:
+                Notification.objects.create(
+                    recipient=recipient,
+                    notification_type=Notification.TYPE_GOODS_RECEIVED,
+                    title=f"Goods Receipt Recorded: {receipt.grn_number}",
+                    message=f"Goods/services have been received under receipt {receipt.grn_number} for PO {po.po_number}.",
+                    target_url=f"/receipts/{receipt.id}/",
+                )
+        except Exception as exc:
+            logger.warning(
+                f"Non-blocking notification delivery failed for GRN {receipt.grn_number}: {exc}",
+                exc_info=True,
+            )
 
     return receipt
 
@@ -236,6 +346,7 @@ def vendor_dispatch_delivery_service(
     delivery_note_number: str = "",
     remarks: str = "",
     delivery_items: list,
+    grn_number: str = None,
 ) -> GoodsReceipt:
     """
     Records a delivery dispatch initiated by the vendor from the Vendor Dashboard.
@@ -277,10 +388,18 @@ def vendor_dispatch_delivery_service(
     if not stores_user:
         stores_user = User.objects.filter(is_superuser=True, is_active=True).first() or vendor_user
 
-    from apps.core.services import generate_document_number
-    from apps.notifications.models import Notification
+    if grn_number and str(grn_number).strip():
+        grn_number = str(grn_number).strip()
+        if GoodsReceipt.objects.filter(grn_number__iexact=grn_number).exists():
+            raise ValidationError(f"Goods receipt with GRN number '{grn_number}' already exists.")
+    else:
+        from apps.core.services import generate_document_number
+        grn_number = generate_document_number(GoodsReceipt, "grn_number", "GRN")
 
-    grn_number = generate_document_number(GoodsReceipt, "grn_number", "GRN")
+    if delivery_note_number and str(delivery_note_number).strip():
+        clean_dn = str(delivery_note_number).strip()
+        if GoodsReceipt.objects.filter(po=po, delivery_note_number__iexact=clean_dn).exists():
+            raise ValidationError(f"A goods receipt with delivery note '{clean_dn}' already exists for Purchase Order {po.po_number}.")
 
     receipt = GoodsReceipt.objects.create(
         grn_number=grn_number,
@@ -293,7 +412,8 @@ def vendor_dispatch_delivery_service(
 
     created_any_line = False
     for item in delivery_items:
-        po_line_id = item.get("po_line_id") or (item["po_line"].id if "po_line" in item else None)
+        po_line_val = item.get("po_line_id") or item.get("po_line")
+        po_line_id = po_line_val.id if hasattr(po_line_val, "id") else po_line_val
         if not po_line_id:
             continue
 
@@ -809,6 +929,9 @@ def handoff_goods_to_stock_service(
     if not lines:
         raise ValidationError("Cannot hand off to stock: Receipt contains no line items.")
 
+    if receipt.overall_inspection_status == "PENDING":
+        raise ValidationError("Cannot hand off to stock: Quality inspection has not been completed on this receipt.")
+
     accepted_lines = [rline for rline in lines if rline.quantity_accepted > Decimal("0.00")]
     if not accepted_lines:
         raise ValidationError(
@@ -1143,7 +1266,8 @@ def _org_scoped_internal_users(role_codes, org=None):
 def resolve_grn_organization(grn):
     """
     Resolves the Organization that owns this Goods Receipt Note, via the PO's
-    cost-center department, falling back to the originating requisition department.
+    cost-center department, falling back to the originating requisition department,
+    PO creator's organization, or PO vendor organization.
     """
     po = grn.po
     if po.cost_center_id and getattr(po.cost_center, "department_id", None):
@@ -1152,7 +1276,17 @@ def resolve_grn_organization(grn):
             return org
     requisition = getattr(po, "requisition", None)
     if requisition and getattr(requisition, "department", None):
-        return getattr(requisition.department, "organization", None)
+        org = getattr(requisition.department, "organization", None)
+        if org:
+            return org
+    if getattr(po, "created_by", None):
+        org = getattr(po.created_by, "effective_organization", None) or getattr(po.created_by, "organization", None)
+        if org:
+            return org
+    if getattr(po, "vendor", None):
+        org = getattr(po.vendor, "organization", None)
+        if org:
+            return org
     return None
 
 
