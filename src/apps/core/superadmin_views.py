@@ -1,7 +1,5 @@
 import csv
-
 import json
-
 from functools import wraps
 
 import openpyxl
@@ -49,11 +47,9 @@ def superadmin_home_view(request):
 
         )
 
-    from apps.core.views import home_view
+    from apps.core.views import superadmin_dashboard_view
 
-
-
-    return home_view(request)
+    return superadmin_dashboard_view(request)
 
 
 
@@ -194,7 +190,7 @@ def user_list_view(request):
 
     users = users.order_by("-date_joined")
 
-    roles = Role.objects.all().order_by("name")
+    roles = Role.objects.exclude(code=Role.VENDOR_USER).order_by("name")
 
 
 
@@ -665,7 +661,9 @@ def user_resend_welcome_email_view(request, user_id):
 
 
 
-        return HttpResponse("<script>window.location.reload();</script>")
+        response = HttpResponse("<script>window.location.reload();</script>")
+        response["HX-Refresh"] = "true"
+        return response
 
     return HttpResponse(status=405)
 
@@ -674,47 +672,44 @@ def user_resend_welcome_email_view(request, user_id):
 
 
 @login_required
-
 def cost_center_options_view(request):
-
     if not _is_super_admin(request.user):
-
         return HttpResponse("<option value=''>-- Unauthorized --</option>", status=403)
-
     dept_id = request.GET.get("department", "").strip()
-
+    user_id = request.GET.get("user_id", "").strip()
     cost_centers = CostCenter.objects.none()
-
     if dept_id:
-
         try:
-
             import uuid
-
             uuid.UUID(dept_id)
-
             cost_centers = CostCenter.objects.filter(department_id=dept_id)
-
             scoped_org = get_user_scoped_org(request.user)
-
             if scoped_org:
-
                 cost_centers = cost_centers.filter(department__organization=scoped_org)
 
+            # Exclude cost centers already assigned to active Requesters so they cannot be double-assigned
+            from apps.accounts.models import Role, User
+            assigned_req_cc_ids = User.objects.filter(
+                role__code=Role.REQUESTER,
+                is_active=True,
+                cost_center__isnull=False,
+            )
+            if user_id:
+                try:
+                    assigned_req_cc_ids = assigned_req_cc_ids.exclude(pk=user_id)
+                except (ValueError, TypeError):
+                    pass
+            assigned_cc_id_set = set(assigned_req_cc_ids.values_list("cost_center_id", flat=True))
+            if assigned_cc_id_set:
+                cost_centers = cost_centers.exclude(id__in=assigned_cc_id_set)
+
             cost_centers = cost_centers.order_by("name")
-
         except (ValueError, AttributeError):
-
             pass
-
     return render(
-
         request,
-
         "pages/dashboards/superadmin/cost_center_options.html",
-
         {"cost_centers": cost_centers},
-
     )
 
 
@@ -763,7 +758,7 @@ def org_list_view(request):
 
     else:
 
-        orgs = Organization.objects.select_related("admin_user").all().order_by("name")
+        orgs = Organization.objects.select_related("admin_user").all().order_by("-created_at", "name")
 
         departments = Department.objects.select_related("organization").all().order_by("name")
 
@@ -834,21 +829,16 @@ def org_list_view(request):
 
 
 @login_required
-
 @super_admin_required
-
 def org_create_view(request):
-
     scoped_org = get_user_scoped_org(request.user)
-
-    if not _is_super_admin(request.user) or scoped_org is not None or not request.user.is_superuser:
-
+    is_root_admin = (
+        scoped_org is None and (_is_super_admin(request.user) or request.user.is_superuser)
+    )
+    if not is_root_admin:
         return HttpResponse(
-
             "<div class='alert alert-danger m-3'>Permission Denied: Only platform administrators without an assigned organization can register new legal entities.</div>",
-
             status=403,
-
         )
 
 
@@ -945,7 +935,9 @@ def org_create_view(request):
 
                 messages.info(request, f"Administrator account '{admin_user.email}' created (welcome email was skipped per checkbox).")
 
-            return HttpResponse("<script>window.location.reload();</script>")
+            response = HttpResponse("<script>window.location.reload();</script>")
+            response["HX-Refresh"] = "true"
+            return response
 
     else:
 
@@ -993,11 +985,25 @@ def org_edit_view(request, org_id):
 
     if request.method == "POST":
 
+        prior_admin_user = org.admin_user
+        prior_active = org.is_active
+
         form = OrganizationAdminForm(request.POST, instance=org)
 
         if form.is_valid():
 
             org = form.save()
+
+            if prior_active != org.is_active:
+                if org.admin_user and org.admin_user.organization_id == org.id:
+                    org.admin_user.is_active = org.is_active
+                    org.admin_user.save(update_fields=["is_active"])
+                if org.procurement_manager and org.procurement_manager.organization_id == org.id:
+                    org.procurement_manager.is_active = org.is_active
+                    org.procurement_manager.save(update_fields=["is_active"])
+                if org.compliance_auditor and org.compliance_auditor.organization_id == org.id:
+                    org.compliance_auditor.is_active = org.is_active
+                    org.compliance_auditor.save(update_fields=["is_active"])
 
             admin_email = form.cleaned_data.get("admin_email")
 
@@ -1020,6 +1026,12 @@ def org_edit_view(request, org_id):
                     admin_user_dropdown.organization = org
 
                     admin_user_dropdown.save(update_fields=["organization"])
+
+            elif not admin_user_dropdown and "admin_user" not in request.POST and prior_admin_user:
+
+                org.admin_user = prior_admin_user
+
+                org.save(update_fields=["admin_user"])
 
 
             # Handle dedicated Procurement Manager update (1:1)
@@ -1229,7 +1241,9 @@ def org_edit_view(request, org_id):
 
             messages.success(request, f"Organization '{org.name}' updated successfully.")
 
-            return HttpResponse("<script>window.location.reload();</script>")
+            response = HttpResponse("<script>window.location.reload();</script>")
+            response["HX-Refresh"] = "true"
+            return response
 
     else:
 
@@ -1667,7 +1681,7 @@ def org_dashboard_view(request, org_id):
 
     # Roles and depts for user filtering
 
-    roles = Role.objects.all().order_by("name")
+    roles = Role.objects.exclude(code=Role.VENDOR_USER).order_by("name")
 
 
 
@@ -1819,7 +1833,9 @@ def org_resend_credentials_view(request, org_id):
 
         messages.error(request, f"Organization '{org.name}' has no assigned administrator user.")
 
-        return HttpResponse("<script>window.location.reload();</script>")
+        response = HttpResponse("<script>window.location.reload();</script>")
+        response["HX-Refresh"] = "true"
+        return response
 
 
 
@@ -1899,7 +1915,10 @@ def org_resend_credentials_view(request, org_id):
 
 
 
-    return HttpResponse("<script>window.location.reload();</script>")
+    response = HttpResponse("<script>window.location.reload();</script>")
+    response["HX-Refresh"] = "true"
+    return response
+
 
 
 
@@ -1957,7 +1976,9 @@ def org_delete_view(request, org_id):
 
             if request.headers.get("HX-Request"):
 
-                return HttpResponse("<script>window.location.reload();</script>")
+                response = HttpResponse("<script>window.location.reload();</script>")
+                response["HX-Refresh"] = "true"
+                return response
 
             return redirect("superadmin:organizations")
 
@@ -2079,7 +2100,9 @@ def dept_create_view(request):
 
 
 
-            return HttpResponse("<script>window.location.reload();</script>")
+            response = HttpResponse("<script>window.location.reload();</script>")
+            response["HX-Refresh"] = "true"
+            return response
 
     else:
 
@@ -2181,7 +2204,9 @@ def dept_edit_view(request, dept_id):
 
 
 
-            return HttpResponse("<script>window.location.reload();</script>")
+            response = HttpResponse("<script>window.location.reload();</script>")
+            response["HX-Refresh"] = "true"
+            return response
 
     else:
 
@@ -2271,7 +2296,9 @@ def cost_center_create_view(request):
 
 
 
-            return HttpResponse("<script>window.location.reload();</script>")
+            response = HttpResponse("<script>window.location.reload();</script>")
+            response["HX-Refresh"] = "true"
+            return response
 
     else:
 
@@ -2381,7 +2408,9 @@ def cost_center_edit_view(request, cc_id):
 
 
 
-            return HttpResponse("<script>window.location.reload();</script>")
+            response = HttpResponse("<script>window.location.reload();</script>")
+            response["HX-Refresh"] = "true"
+            return response
 
     else:
 
@@ -2541,7 +2570,9 @@ def fiscal_period_create_view(request):
 
             )
 
-            return HttpResponse("<script>window.location.reload();</script>")
+            response = HttpResponse("<script>window.location.reload();</script>")
+            response["HX-Refresh"] = "true"
+            return response
 
     else:
 
@@ -2657,7 +2688,9 @@ def fiscal_period_edit_view(request, period_id):
 
             )
 
-            return HttpResponse("<script>window.location.reload();</script>")
+            response = HttpResponse("<script>window.location.reload();</script>")
+            response["HX-Refresh"] = "true"
+            return response
 
     else:
 
@@ -2798,6 +2831,21 @@ def _get_scoped_audit_logs(request):
 
         )
 
+    # Pagination support for large exports — prevent timeout on big datasets
+    try:
+        limit = int(request.GET.get("limit", "10000"))
+    except (ValueError, TypeError):
+        limit = 10000
+    if limit > 50000:
+        limit = 50000
+
+    try:
+        offset = int(request.GET.get("offset", "0"))
+    except (ValueError, TypeError):
+        offset = 0
+
+    logs = logs[offset:offset + limit]
+
     return logs
 
 
@@ -2864,7 +2912,9 @@ def budget_create_view(request):
 
             form.save()
 
-            return HttpResponse("<script>window.location.reload();</script>")
+            response = HttpResponse("<script>window.location.reload();</script>")
+            response["HX-Refresh"] = "true"
+            return response
 
     else:
 
@@ -2918,7 +2968,9 @@ def budget_edit_view(request, budget_id):
 
             form.save()
 
-            return HttpResponse("<script>window.location.reload();</script>")
+            response = HttpResponse("<script>window.location.reload();</script>")
+            response["HX-Refresh"] = "true"
+            return response
 
     else:
 
@@ -2954,7 +3006,9 @@ def policy_create_view(request):
                 new_state={"name": policy.name, "module": policy.module, "status": policy.status},
                 ip_address=request.META.get("REMOTE_ADDR"),
             )
-            return HttpResponse("<script>window.location.reload();</script>")
+            response = HttpResponse("<script>window.location.reload();</script>")
+            response["HX-Refresh"] = "true"
+            return response
     else:
         form = PolicyAdminForm(request=request, initial={"is_active": True, "status": ApprovalPolicy.STATUS_ACTIVE})
 
@@ -2996,6 +3050,9 @@ def policy_create_view(request):
     if scoped_org:
         user_qs = user_qs.filter(Q(organization=scoped_org) | Q(department__organization=scoped_org))
 
+    submitted_steps = request.POST.get("steps_data") if request.method == "POST" else None
+    steps_json = submitted_steps if submitted_steps else json.dumps(initial_steps)
+
     return render(
         request,
         "pages/dashboards/superadmin/policy_form.html",
@@ -3003,7 +3060,7 @@ def policy_create_view(request):
             "form": form,
             "is_edit": False,
             "policy": None,
-            "steps_json": json.dumps(initial_steps),
+            "steps_json": steps_json,
             "available_roles": available_roles,
             "available_users": user_qs,
         },
@@ -3049,7 +3106,9 @@ def policy_edit_view(request, policy_id):
                 new_state={"name": updated.name, "module": updated.module, "status": updated.status, "version": updated.version},
                 ip_address=request.META.get("REMOTE_ADDR"),
             )
-            return HttpResponse("<script>window.location.reload();</script>")
+            response = HttpResponse("<script>window.location.reload();</script>")
+            response["HX-Refresh"] = "true"
+            return response
     else:
         form = PolicyAdminForm(instance=policy, request=request)
 
@@ -3074,6 +3133,9 @@ def policy_edit_view(request, policy_id):
     if scoped_org:
         user_qs = user_qs.filter(Q(organization=scoped_org) | Q(department__organization=scoped_org))
 
+    submitted_steps = request.POST.get("steps_data") if request.method == "POST" else None
+    steps_json = submitted_steps if submitted_steps else json.dumps(steps_list)
+
     return render(
         request,
         "pages/dashboards/superadmin/policy_form.html",
@@ -3081,7 +3143,7 @@ def policy_edit_view(request, policy_id):
             "form": form,
             "is_edit": True,
             "policy": policy,
-            "steps_json": json.dumps(steps_list),
+            "steps_json": steps_json,
             "available_roles": available_roles,
             "available_users": user_qs,
         },
@@ -3493,7 +3555,9 @@ def location_create_view(request):
 
             messages.success(request, f"Location '{loc.name}' ({loc.code}) created successfully.")
 
-            return HttpResponse("<script>window.location.reload();</script>")
+            response = HttpResponse("<script>window.location.reload();</script>")
+            response["HX-Refresh"] = "true"
+            return response
 
     else:
 
@@ -3585,7 +3649,9 @@ def location_edit_view(request, location_id):
 
             messages.success(request, f"Location '{updated_loc.name}' updated successfully.")
 
-            return HttpResponse("<script>window.location.reload();</script>")
+            response = HttpResponse("<script>window.location.reload();</script>")
+            response["HX-Refresh"] = "true"
+            return response
 
     else:
 
@@ -3648,10 +3714,114 @@ def location_delete_view(request, location_id):
         )
 
         loc.delete()
-
         messages.success(request, f"Location '{loc_name}' ({loc_code}) has been deleted.")
-
     return redirect(request.META.get("HTTP_REFERER", "/superadmin/locations/"))
+
+
+@super_admin_required
+def dept_delete_view(request, dept_id):
+    scoped_org = get_user_scoped_org(request.user)
+    if scoped_org:
+        dept = get_object_or_404(Department, pk=dept_id, organization=scoped_org)
+    else:
+        dept = get_object_or_404(Department, pk=dept_id)
+
+    if request.method == "POST":
+        dept_name = dept.name
+        dept_code = dept.code
+        dept_id_str = str(dept.id)
+        from django.db.models import ProtectedError
+
+        from apps.audit.services import create_audit_log_service
+        try:
+            create_audit_log_service(
+                actor=request.user,
+                action=AuditLog.ACTION_DELETE,
+                target_model="Department",
+                target_object_id=dept_id_str,
+                previous_state={"name": dept_name, "code": dept_code},
+                new_state=None,
+                ip_address=request.META.get("REMOTE_ADDR"),
+                user_agent=request.META.get("HTTP_USER_AGENT", ""),
+            )
+            dept.delete()
+            messages.success(request, f"Department '{dept_name}' ({dept_code}) has been deleted successfully.")
+        except ProtectedError:
+            messages.error(request, f"Cannot delete Department '{dept_name}' ({dept_code}) because active users, cost centers, or requisitions are linked to it.")
+    return redirect(request.META.get("HTTP_REFERER", "/superadmin/organizations/"))
+
+
+@super_admin_required
+def cost_center_delete_view(request, cc_id):
+    scoped_org = get_user_scoped_org(request.user)
+    if scoped_org:
+        cc = get_object_or_404(CostCenter, pk=cc_id, department__organization=scoped_org)
+    else:
+        cc = get_object_or_404(CostCenter, pk=cc_id)
+
+    if request.method == "POST":
+        cc_name = cc.name
+        cc_code = cc.code
+        cc_id_str = str(cc.id)
+        from django.db.models import ProtectedError
+
+        from apps.audit.services import create_audit_log_service
+        try:
+            create_audit_log_service(
+                actor=request.user,
+                action=AuditLog.ACTION_DELETE,
+                target_model="CostCenter",
+                target_object_id=cc_id_str,
+                previous_state={"name": cc_name, "code": cc_code},
+                new_state=None,
+                ip_address=request.META.get("REMOTE_ADDR"),
+                user_agent=request.META.get("HTTP_USER_AGENT", ""),
+            )
+            cc.delete()
+            messages.success(request, f"Cost Center '{cc_name}' ({cc_code}) has been deleted successfully.")
+        except ProtectedError:
+            messages.error(request, f"Cannot delete Cost Center '{cc_name}' ({cc_code}) because active budgets, users, or requisitions are linked to it.")
+    return redirect(request.META.get("HTTP_REFERER", "/superadmin/organizations/"))
+
+
+@super_admin_required
+def user_delete_view(request, user_id):
+    target_user = get_object_or_404(User, pk=user_id)
+    if request.user.pk == target_user.pk:
+        messages.error(request, "You cannot delete your own account.")
+        return redirect(request.META.get("HTTP_REFERER", "/superadmin/users/"))
+
+    scoped_org = get_user_scoped_org(request.user)
+    if scoped_org:
+        user_org_id = target_user.organization_id or (target_user.department.organization_id if target_user.department else None)
+        if user_org_id != scoped_org.id:
+            messages.error(request, "Permission Denied: User belongs to another organization.")
+            return redirect(request.META.get("HTTP_REFERER", "/superadmin/users/"))
+
+    if request.method == "POST":
+        user_email = target_user.email
+        user_id_str = str(target_user.id)
+        from django.db.models import ProtectedError
+
+        from apps.audit.services import create_audit_log_service
+        try:
+            create_audit_log_service(
+                actor=request.user,
+                action=AuditLog.ACTION_DELETE,
+                target_model="User",
+                target_object_id=user_id_str,
+                previous_state={"email": user_email},
+                new_state=None,
+                ip_address=request.META.get("REMOTE_ADDR"),
+                user_agent=request.META.get("HTTP_USER_AGENT", ""),
+            )
+            target_user.delete()
+            messages.success(request, f"User '{user_email}' has been deleted successfully.")
+        except ProtectedError:
+            target_user.is_active = False
+            target_user.save(update_fields=["is_active"])
+            messages.warning(request, f"User '{user_email}' has linked transaction history and cannot be hard deleted. The account has been deactivated instead.")
+    return redirect(request.META.get("HTTP_REFERER", "/superadmin/users/"))
 
 
 
@@ -3672,3 +3842,120 @@ def user_toggle_status_view(request, user_id):
     response = HttpResponse("<script>window.location.reload();</script>")
     response["HX-Refresh"] = "true"
     return response
+
+
+@login_required
+@super_admin_required
+def contact_enquiry_list_view(request):
+    """Stylish Super Admin workspace view for triaging and managing Contact Enquiries."""
+    from django.db.models import Count
+
+    from apps.core.models import ContactEnquiry
+
+    qs = ContactEnquiry.objects.all().order_by("-created_at")
+
+    search_q = request.GET.get("q", "").strip()
+    status_filter = request.GET.get("status", "").strip().upper()
+
+    valid_statuses = {code for code, _ in ContactEnquiry.STATUS_CHOICES}
+    if status_filter and status_filter in valid_statuses:
+        qs_filtered = qs.filter(status=status_filter)
+    else:
+        status_filter = ""
+        qs_filtered = qs
+
+    if search_q:
+        qs_filtered = qs_filtered.filter(
+            Q(name__icontains=search_q)
+            | Q(email__icontains=search_q)
+            | Q(phone__icontains=search_q)
+            | Q(message__icontains=search_q)
+            | Q(notes__icontains=search_q)
+        )
+
+    raw_counts = dict(
+        ContactEnquiry.objects.values("status").annotate(cnt=Count("id")).values_list("status", "cnt")
+    )
+    status_counts = {
+        "ALL": ContactEnquiry.objects.count(),
+        "NEW": raw_counts.get(ContactEnquiry.STATUS_NEW, 0),
+        "IN_REVIEW": raw_counts.get(ContactEnquiry.STATUS_IN_REVIEW, 0),
+        "CONTACTED": raw_counts.get(ContactEnquiry.STATUS_CONTACTED, 0),
+        "RESOLVED": raw_counts.get(ContactEnquiry.STATUS_RESOLVED, 0),
+        "SPAM": raw_counts.get(ContactEnquiry.STATUS_SPAM, 0),
+    }
+
+    paginator = Paginator(qs_filtered, 12)
+    page_obj = paginator.get_page(request.GET.get("page"))
+
+    query_params = request.GET.copy()
+    if "page" in query_params:
+        query_params.pop("page")
+
+    return render(
+        request,
+        "pages/dashboards/superadmin/contact_enquiries.html",
+        {
+            "page_obj": page_obj,
+            "enquiries": page_obj.object_list,
+            "status_counts": status_counts,
+            "status_choices": ContactEnquiry.STATUS_CHOICES,
+            "search_q": search_q,
+            "status_filter": status_filter,
+            "querystring": query_params.urlencode(),
+        },
+    )
+
+
+@login_required
+@super_admin_required
+def contact_enquiry_status_view(request, enquiry_id):
+    """Persist Contact Enquiry triage status and staff notes with audit logging."""
+    from apps.core.models import ContactEnquiry
+
+    if request.method != "POST":
+        return redirect("superadmin:contact_enquiries")
+
+    enquiry = get_object_or_404(ContactEnquiry, pk=enquiry_id)
+    new_status = request.POST.get("status", "").strip().upper()
+    notes = request.POST.get("notes", None)
+
+    valid_statuses = {code for code, _ in ContactEnquiry.STATUS_CHOICES}
+    if new_status not in valid_statuses:
+        messages.error(request, "Invalid enquiry status selected.")
+        return redirect("superadmin:contact_enquiries")
+
+    prev_status = enquiry.status
+    with transaction.atomic():
+        enquiry.status = new_status
+        update_fields = ["status", "updated_at"]
+        if notes is not None:
+            enquiry.notes = notes.strip()
+            update_fields.append("notes")
+        enquiry.save(update_fields=update_fields)
+
+        AuditLog.objects.create(
+            actor=request.user,
+            action="CONTACT_ENQUIRY_UPDATED",
+            target_model="ContactEnquiry",
+            target_object_id=str(enquiry.id),
+            previous_state={"status": prev_status},
+            new_state={"status": new_status},
+            ip_address=request.META.get("REMOTE_ADDR"),
+            user_agent=request.META.get("HTTP_USER_AGENT", ""),
+        )
+
+    messages.success(
+        request,
+        f"Enquiry from {enquiry.name} updated to '{enquiry.get_status_display()}'.",
+    )
+    next_url = request.POST.get("next", "").strip()
+    if next_url and (
+        next_url.startswith("/admin/contact-enquiries")
+        or next_url.startswith("/superadmin/contact-enquiries")
+    ):
+        return redirect(next_url)
+    if request.path.startswith("/admin/"):
+        return redirect("admin_contact_enquiries")
+    return redirect("superadmin:contact_enquiries")
+

@@ -1,13 +1,16 @@
-﻿from decimal import Decimal
+from decimal import Decimal
+from functools import wraps
 
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
+from django.core.exceptions import PermissionDenied
 from django.db import connection
 from django.db.models import Avg, Count, Q, Sum
 from django.http import JsonResponse
 from django.shortcuts import redirect, render
 from django.utils import timezone
+from django.views.decorators.http import require_http_methods
 from redis import Redis
 from rest_framework.permissions import AllowAny
 from rest_framework.views import APIView
@@ -36,19 +39,33 @@ def health_check_view(request):
         with connection.cursor() as cursor:
             cursor.execute("SELECT 1;")
             health_status["database"] = "ok"
-    except Exception as e:
-        health_status["database"] = f"error: {str(e)}"
+    except Exception:
+        health_status["database"] = "disconnected"
         health_status["status"] = "unhealthy"
 
-    # Check Redis connection
+    # Check Redis connection safely without leaking hostnames/credentials (DEF-005)
     try:
         redis_client = Redis.from_url(settings.REDIS_URL, socket_timeout=2)
         if redis_client.ping():
             health_status["redis"] = "ok"
-    except Exception as e:
-        health_status["redis"] = f"offline (local mode): {str(e)}"
+        else:
+            health_status["redis"] = "disconnected"
+            health_status["status"] = "degraded"
+    except Exception:
+        # Check cache fallback
+        try:
+            from django.core.cache import cache
+            cache.set("health_check_ping", "1", 10)
+            if cache.get("health_check_ping") == "1":
+                health_status["redis"] = "ok"
+            else:
+                health_status["redis"] = "disconnected"
+                health_status["status"] = "degraded"
+        except Exception:
+            health_status["redis"] = "disconnected"
+            health_status["status"] = "degraded"
 
-    http_status = 200 if health_status["status"] == "healthy" else 503
+    http_status = 200 if health_status["status"] in ("healthy", "degraded") else 503
     return JsonResponse(health_status, status=http_status)
 
 
@@ -89,6 +106,28 @@ def get_dashboard_url_for_user(user):
     return role_url_map.get(role_code, "/requester/")
 
 
+def dashboard_role_required(allowed_roles):
+    """
+    Enforces backend RBAC on dashboard direct URLs (resolves DEF-005).
+    Raises PermissionDenied (HTTP 403) if authenticated user's role is not permitted.
+    """
+    def decorator(view_func):
+        @wraps(view_func)
+        def _wrapped(request, *args, **kwargs):
+            if not request.user or not request.user.is_authenticated:
+                return redirect("/login/")
+            if request.user.is_superuser:
+                return view_func(request, *args, **kwargs)
+            role_code = getattr(request.user, "role_code", None) or (
+                request.user.role.code if hasattr(request.user, "role") and request.user.role else None
+            )
+            if role_code not in allowed_roles:
+                raise PermissionDenied(f"Access restricted to {', '.join(allowed_roles)} role(s).")
+            return view_func(request, *args, **kwargs)
+        return _wrapped
+    return decorator
+
+
 @login_required(login_url="/login/")
 def dashboard_redirect_view(request):
     """
@@ -99,8 +138,16 @@ def dashboard_redirect_view(request):
 
 
 @login_required(login_url="/login/")
+@dashboard_role_required([Role.REQUESTER, Role.SUPER_ADMIN])
 def requester_dashboard_view(request):
     user = request.user
+    role_code = getattr(user, "role_code", None) or (
+        user.role.code if hasattr(user, "role") and user.role else None
+    )
+    if not user.is_superuser and role_code not in [Role.REQUESTER, Role.SUPER_ADMIN]:
+        from django.core.exceptions import PermissionDenied
+        raise PermissionDenied("Permission Denied: Requester access required.")
+
     my_prs = PurchaseRequisition.objects.filter(requester=user).prefetch_related(
         "purchase_orders", "sourcing_events"
     )
@@ -118,6 +165,7 @@ def requester_dashboard_view(request):
 
 
 @login_required(login_url="/login/")
+@dashboard_role_required([Role.PROC_MGR, Role.SUPER_ADMIN])
 def manager_dashboard_view(request):
     from apps.core.manager_views import manager_dashboard_view as mgr_view
 
@@ -125,8 +173,16 @@ def manager_dashboard_view(request):
 
 
 @login_required(login_url="/login/")
+@dashboard_role_required([Role.STORES_RECEIVER, Role.SUPER_ADMIN])
 def stores_dashboard_view(request):
     user = request.user
+    role_code = getattr(user, "role_code", None) or (
+        user.role.code if hasattr(user, "role") and user.role else None
+    )
+    if not user.is_superuser and role_code not in [Role.STORES_RECEIVER, Role.SUPER_ADMIN]:
+        from django.core.exceptions import PermissionDenied
+        raise PermissionDenied("Permission Denied: Stores & Receiving Desk access required.")
+
     from apps.receipts.views import get_stores_dashboard_data
 
     data = get_stores_dashboard_data(user)
@@ -145,6 +201,7 @@ def stores_dashboard_view(request):
 
 
 @login_required(login_url="/login/")
+@dashboard_role_required([Role.VENDOR_USER, Role.SUPER_ADMIN])
 def vendor_dashboard_view(request):
     from apps.vendors.vendor_dashboard_views import vendor_dashboard_overview_view
 
@@ -152,24 +209,98 @@ def vendor_dashboard_view(request):
 
 
 @login_required(login_url="/login/")
+@dashboard_role_required([Role.FINANCE_AP, Role.SUPER_ADMIN])
 def finance_dashboard_view(request):
+    user = request.user
+    role_code = getattr(user, "role_code", None) or (
+        user.role.code if hasattr(user, "role") and user.role else None
+    )
+    if not user.is_superuser and role_code not in [Role.FINANCE_AP, Role.SUPER_ADMIN]:
+        from django.core.exceptions import PermissionDenied
+        raise PermissionDenied("Permission Denied: Finance & AP Workspace access required.")
+
     from apps.budgets.models import SpendLedger
     from apps.invoices.models import MatchException, SupplierInvoice
     from apps.notifications.models import Notification
     from apps.organization.models import CostCenter, Department
 
-    selected_dept_id = request.GET.get("dept") or ""
-    selected_cc_id = request.GET.get("cost_center") or ""
+    raw_dept = (
+        request.GET.get("dept")
+        or request.GET.get("department")
+        or request.GET.get("department_id")
+        or ""
+    ).strip()
+    raw_cc = (
+        request.GET.get("cost_center")
+        or request.GET.get("cost_center_id")
+        or request.GET.get("cc")
+        or ""
+    ).strip()
 
     scoped_org = getattr(request.user, "effective_organization", None) if not (request.user.is_superuser and not request.user.organization_id) else None
 
     departments = Department.objects.all().order_by("name")
     cost_centers = CostCenter.objects.select_related("department").all().order_by("code")
 
+    if scoped_org:
+        departments = departments.filter(organization=scoped_org)
+        cost_centers = cost_centers.filter(department__organization=scoped_org)
+
+    # Resolve department identifier (UUID, code, or name)
+    selected_dept_obj = None
+    selected_dept_id = ""
+    if raw_dept:
+        import uuid
+
+        is_dept_uuid = False
+        try:
+            uuid.UUID(str(raw_dept))
+            is_dept_uuid = True
+        except (ValueError, AttributeError, TypeError):
+            is_dept_uuid = False
+
+        if is_dept_uuid:
+            selected_dept_obj = departments.filter(id=raw_dept).first()
+        if not selected_dept_obj:
+            selected_dept_obj = departments.filter(
+                Q(code__iexact=raw_dept) | Q(name__iexact=raw_dept)
+            ).first()
+
+        if selected_dept_obj:
+            selected_dept_id = str(selected_dept_obj.id)
+        else:
+            selected_dept_id = "00000000-0000-0000-0000-000000000000"
+
+    # Resolve cost center identifier (UUID, code, or name)
+    selected_cc_obj = None
+    selected_cc_id = ""
+    if raw_cc:
+        import uuid
+
+        is_cc_uuid = False
+        try:
+            uuid.UUID(str(raw_cc))
+            is_cc_uuid = True
+        except (ValueError, AttributeError, TypeError):
+            is_cc_uuid = False
+
+        if is_cc_uuid:
+            selected_cc_obj = cost_centers.filter(id=raw_cc).first()
+        if not selected_cc_obj:
+            selected_cc_obj = cost_centers.filter(
+                Q(code__iexact=raw_cc) | Q(name__iexact=raw_cc)
+            ).first()
+
+        if selected_cc_obj:
+            selected_cc_id = str(selected_cc_obj.id)
+        else:
+            selected_cc_id = "00000000-0000-0000-0000-000000000000"
+
     open_match_exceptions = (
         MatchException.objects.filter(status=MatchException.STATUS_OPEN)
         .select_related(
             "invoice__vendor",
+            "invoice__po__cost_center__department",
             "invoice__po__requisition__department",
             "invoice__po__requisition__cost_center",
         )
@@ -195,9 +326,47 @@ def finance_dashboard_view(request):
             ]
         )
         .exclude(id__in=user_approved_pr_ids)
-        .select_related("department", "cost_center", "requester")
+        .select_related("department", "department__organization", "cost_center", "cost_center__department__organization", "requester")
         .order_by("-updated_at")
     )
+
+    from django.db.models import Count
+
+    from apps.approvals.models import ApprovalPolicy
+    from apps.approvals.services import evaluate_approval_chain
+
+    candidate_pr_ids = list(pending_finance_prs.values_list("id", flat=True))
+    finance_pr_ids = []
+    if candidate_pr_ids:
+        step_counts = {
+            str(k): v
+            for k, v in ApprovalAction.objects.filter(
+                target_object_id__in=[str(pid) for pid in candidate_pr_ids],
+                target_model_name="PurchaseRequisition",
+                action=ApprovalAction.ACTION_APPROVE,
+            )
+            .values("target_object_id")
+            .annotate(cnt=Count("id"))
+            .values_list("target_object_id", "cnt")
+        }
+        for cand in pending_finance_prs:
+            cand_org = (
+                getattr(getattr(cand, "department", None), "organization", None)
+                or getattr(getattr(getattr(cand, "cost_center", None), "department", None), "organization", None)
+                or getattr(cand.requester, "effective_organization", None)
+            )
+            chain = evaluate_approval_chain(
+                module=ApprovalPolicy.MODULE_PR,
+                amount=cand.total_amount,
+                department=cand.department,
+                cost_center=cand.cost_center,
+                organization=cand_org,
+            )
+            idx = step_counts.get(str(cand.id), 0)
+            if chain and idx < len(chain):
+                if chain[idx]["approver_role"].code == Role.FINANCE_AP:
+                    finance_pr_ids.append(cand.id)
+    pending_finance_prs = pending_finance_prs.filter(id__in=finance_pr_ids)
 
     ready_for_payment_qs = SupplierInvoice.objects.filter(
         status=SupplierInvoice.STATUS_READY_FOR_PAYMENT
@@ -206,8 +375,6 @@ def finance_dashboard_view(request):
     actual_spend_qs = SpendLedger.objects.filter(entry_type=SpendLedger.ENTRY_ACTUAL)
 
     if scoped_org:
-        departments = departments.filter(organization=scoped_org)
-        cost_centers = cost_centers.filter(department__organization=scoped_org)
         open_match_exceptions = open_match_exceptions.filter(
             Q(invoice__po__cost_center__department__organization=scoped_org)
             | Q(invoice__po__requisition__department__organization=scoped_org)
@@ -234,20 +401,28 @@ def finance_dashboard_view(request):
         )
 
     all_cost_centers = list(cost_centers)
-    if selected_dept_id:
-        filtered_cost_centers = [cc for cc in all_cost_centers if str(cc.department_id) == str(selected_dept_id)]
+    if selected_dept_obj:
+        filtered_cost_centers = [cc for cc in all_cost_centers if cc.department_id == selected_dept_obj.id]
     else:
         filtered_cost_centers = all_cost_centers
 
     if selected_dept_id:
-        open_budget_exceptions = open_budget_exceptions.filter(department_id=selected_dept_id)
-        pending_finance_prs = pending_finance_prs.filter(department_id=selected_dept_id)
+        open_budget_exceptions = open_budget_exceptions.filter(
+            Q(department_id=selected_dept_id) | Q(cost_center__department_id=selected_dept_id)
+        ).distinct()
+        pending_finance_prs = pending_finance_prs.filter(
+            Q(department_id=selected_dept_id) | Q(cost_center__department_id=selected_dept_id)
+        ).distinct()
         open_match_exceptions = open_match_exceptions.filter(
-            invoice__po__requisition__department_id=selected_dept_id
-        )
+            Q(invoice__po__cost_center__department_id=selected_dept_id)
+            | Q(invoice__po__requisition__department_id=selected_dept_id)
+            | Q(invoice__po__requisition__cost_center__department_id=selected_dept_id)
+        ).distinct()
         ready_for_payment_qs = ready_for_payment_qs.filter(
-            po__requisition__department_id=selected_dept_id
-        )
+            Q(po__cost_center__department_id=selected_dept_id)
+            | Q(po__requisition__department_id=selected_dept_id)
+            | Q(po__requisition__cost_center__department_id=selected_dept_id)
+        ).distinct()
         committed_spend_qs = committed_spend_qs.filter(
             budget__cost_center__department_id=selected_dept_id
         )
@@ -259,11 +434,13 @@ def finance_dashboard_view(request):
         open_budget_exceptions = open_budget_exceptions.filter(cost_center_id=selected_cc_id)
         pending_finance_prs = pending_finance_prs.filter(cost_center_id=selected_cc_id)
         open_match_exceptions = open_match_exceptions.filter(
-            invoice__po__requisition__cost_center_id=selected_cc_id
-        )
+            Q(invoice__po__cost_center_id=selected_cc_id)
+            | Q(invoice__po__requisition__cost_center_id=selected_cc_id)
+        ).distinct()
         ready_for_payment_qs = ready_for_payment_qs.filter(
-            po__requisition__cost_center_id=selected_cc_id
-        )
+            Q(po__cost_center_id=selected_cc_id)
+            | Q(po__requisition__cost_center_id=selected_cc_id)
+        ).distinct()
         committed_spend_qs = committed_spend_qs.filter(
             budget__cost_center_id=selected_cc_id
         )
@@ -278,33 +455,32 @@ def finance_dashboard_view(request):
         actual_spend_qs.aggregate(total=Sum("amount"))["total"] or 0
     )
 
-    selected_dept_obj = None
-    if selected_dept_id:
-        selected_dept_obj = next((d for d in departments if str(d.id) == str(selected_dept_id)), None)
-
-    selected_cc_obj = None
-    if selected_cc_id:
-        selected_cc_obj = next((c for c in all_cost_centers if str(c.id) == str(selected_cc_id)), None)
-
     user_org_name = scoped_org.name if scoped_org else ("Global Enterprise" if request.user.is_superuser else "")
+
+    total_pending_exceptions = open_match_exceptions.count()
+    from django.core.paginator import Paginator
+    exceptions_paginator = Paginator(open_match_exceptions, 10)
+    page_num = request.GET.get("page", 1)
+    exceptions_page = exceptions_paginator.get_page(page_num)
 
     context = {
         "metrics": {
-            "pending_match_exceptions": open_match_exceptions.count(),
+            "pending_match_exceptions": total_pending_exceptions,
             "pending_budget_exceptions": open_budget_exceptions.count(),
             "pending_pr_approvals": pending_finance_prs.count(),
             "ready_for_payment": ready_for_payment_qs.count(),
             "committed_spend": float(committed_spend),
             "actual_spend": float(actual_spend),
         },
-        "open_match_exceptions": open_match_exceptions[:10],
+        "open_match_exceptions": exceptions_page,
+        "match_exceptions_page": exceptions_page,
         "open_budget_exceptions": open_budget_exceptions[:10],
         "pending_finance_prs": pending_finance_prs[:10],
         "departments": departments,
         "cost_centers": filtered_cost_centers,
         "all_cost_centers": all_cost_centers,
-        "selected_dept_id": selected_dept_id,
-        "selected_cc_id": selected_cc_id,
+        "selected_dept_id": selected_dept_id if selected_dept_obj else "",
+        "selected_cc_id": selected_cc_id if selected_cc_obj else "",
         "selected_dept_obj": selected_dept_obj,
         "selected_cc_obj": selected_cc_obj,
         "user_org_name": user_org_name,
@@ -314,8 +490,16 @@ def finance_dashboard_view(request):
 
 
 @login_required(login_url="/login/")
+@dashboard_role_required([Role.PROC_EXEC, Role.SUPER_ADMIN])
 def procurement_dashboard_view(request):
     user = request.user
+    role_code = getattr(user, "role_code", None) or (
+        user.role.code if hasattr(user, "role") and user.role else None
+    )
+    if not user.is_superuser and role_code not in [Role.PROC_EXEC, Role.SUPER_ADMIN]:
+        from django.core.exceptions import PermissionDenied
+        raise PermissionDenied("Permission Denied: Procurement Executive access required.")
+
     from apps.notifications.models import Notification
     from apps.sourcing.selectors import get_sourcing_dashboard_metrics
     from apps.sourcing.services import sync_all_event_windows
@@ -407,6 +591,7 @@ def procurement_dashboard_view(request):
 
 
 @login_required(login_url="/login/")
+@dashboard_role_required([Role.LEGAL_MGR, Role.SUPER_ADMIN])
 def legal_dashboard_view(request):
     from apps.contracts.views import dashboard_view as contract_dashboard_view
 
@@ -414,8 +599,16 @@ def legal_dashboard_view(request):
 
 
 @login_required(login_url="/login/")
+@dashboard_role_required([Role.DEPT_APPROVER, Role.SUPER_ADMIN])
 def approver_dashboard_view(request):
     user = request.user
+    role_code = getattr(user, "role_code", None) or (
+        user.role.code if hasattr(user, "role") and user.role else None
+    )
+    if not user.is_superuser and role_code not in [Role.DEPT_APPROVER, Role.SUPER_ADMIN]:
+        from django.core.exceptions import PermissionDenied
+        raise PermissionDenied("Permission Denied: Department Approver access required.")
+
     user_department = getattr(user, "department", None)
     from apps.budgets.models import Budget
     from apps.organization.models import CostCenter, Department, FiscalPeriod
@@ -440,14 +633,28 @@ def approver_dashboard_view(request):
             "Dashboard figures are limited until an administrator assigns your scope.",
         )
 
+    user_org = getattr(user, "organization", None) or (
+        user_department.organization if user_department else None
+    )
     if user_department:
+        depts_with_approvers = Department.objects.filter(
+            organization=user_org,
+            users__role__code=Role.DEPT_APPROVER,
+            users__is_active=True,
+        ).exclude(id=user_department.id)
+
         dept_prs = PurchaseRequisition.objects.filter(
-            Q(department=user_department) | Q(cost_center__manager=user)
-        ).distinct()
-    elif getattr(user, "organization", None):
+            Q(department=user_department)
+            | Q(cost_center__manager=user)
+            | (
+                Q(department__organization=user_org)
+                & ~Q(department__in=depts_with_approvers)
+            )
+        ).exclude(status=PurchaseRequisition.STATUS_DRAFT).distinct()
+    elif user_org:
         dept_prs = PurchaseRequisition.objects.filter(
-            Q(department__organization=user.organization) | Q(cost_center__manager=user)
-        ).distinct()
+            Q(department__organization=user_org) | Q(cost_center__manager=user)
+        ).exclude(status=PurchaseRequisition.STATUS_DRAFT).distinct()
     else:
         dept_prs = PurchaseRequisition.objects.none()
 
@@ -455,7 +662,7 @@ def approver_dashboard_view(request):
     user_approved_pr_ids = ApprovalAction.objects.filter(
         actor=user,
         target_model_name="PurchaseRequisition",
-        action=ApprovalAction.ACTION_APPROVE,
+        action__in=[ApprovalAction.ACTION_APPROVE, ApprovalAction.ACTION_REJECT],
     ).values_list("target_object_id", flat=True)
 
     pending_prs_qs = (
@@ -469,31 +676,104 @@ def approver_dashboard_view(request):
     budget_overrun_count = budget_overrun_qs.count()
 
     now = timezone.now()
+    today_date = now.date()
     user_org = getattr(user, "organization", None) or (
         user_department.organization if user_department else None
     )
-    period_filter = Q(start_date__lte=now, end_date__gte=now, is_closed=False)
+    period_filter = Q(start_date__lte=today_date, end_date__gte=today_date, is_closed=False)
     if user_org:
-        current_period = FiscalPeriod.objects.filter(
+        has_open_period = FiscalPeriod.objects.filter(
             period_filter, organization=user_org
-        ).first()
+        ).exists()
     else:
-        current_period = FiscalPeriod.objects.filter(period_filter).first()
+        has_open_period = FiscalPeriod.objects.filter(period_filter).exists()
 
-    available_budget = 0
-    if current_period:
-        if user_department:
-            dept_ccs = CostCenter.objects.filter(
-                Q(department=user_department) | Q(manager=user)
-            ).distinct()
-        elif getattr(user, "organization", None):
-            dept_ccs = CostCenter.objects.filter(department__organization=user.organization)
-        else:
-            dept_ccs = CostCenter.objects.filter(manager=user)
-        budgets = Budget.objects.filter(
-            cost_center__in=dept_ccs, fiscal_period=current_period
+    if user_department:
+        dept_ccs = CostCenter.objects.filter(
+            Q(department=user_department)
+            | Q(manager=user)
+            | (
+                Q(department__organization=user_org)
+                & ~Q(department__in=depts_with_approvers)
+            )
+        ).distinct()
+    elif user_org:
+        dept_ccs = CostCenter.objects.filter(department__organization=user_org)
+    else:
+        dept_ccs = CostCenter.objects.filter(manager=user)
+
+    # Query active budgets directly for department cost centers (consistent with
+    # detail_view / validate_budget_availability_service) instead of binding to a
+    # single arbitrary FiscalPeriod.first().
+    budgets = list(
+        Budget.objects.filter(
+            cost_center__in=dept_ccs,
+            fiscal_period__start_date__lte=today_date,
+            fiscal_period__end_date__gte=today_date,
+            fiscal_period__is_closed=False,
         )
-        available_budget = sum([b.available_amount for b in budgets])
+    )
+    if not budgets:
+        budgets = list(
+            Budget.objects.filter(
+                cost_center__in=dept_ccs,
+                fiscal_period__is_closed=False,
+            )
+        )
+    if not has_open_period:
+        has_open_period = bool(budgets) or FiscalPeriod.objects.filter(is_closed=False).exists()
+
+    raw_available_budget = sum((b.available_amount for b in budgets), Decimal("0.00"))
+    available_budget = max(Decimal("0.00"), raw_available_budget)
+
+    is_budget_overdrawn = raw_available_budget < Decimal("0.00")
+    budget_overrun_amount = (
+        abs(raw_available_budget) if is_budget_overdrawn else Decimal("0.00")
+    )
+
+    # Budget validation for pending PR queue to prevent unauthorized approval of over-budget or unfunded PRs
+    pending_list = list(pending_prs_qs[:10])
+    cc_ids = [pr.cost_center_id for pr in pending_list if pr.cost_center_id]
+    active_budgets = {}
+    if cc_ids:
+        cc_budgets = Budget.objects.filter(
+            cost_center_id__in=cc_ids,
+            fiscal_period__start_date__lte=today_date,
+            fiscal_period__end_date__gte=today_date,
+            fiscal_period__is_closed=False,
+        ).order_by("-fiscal_period__start_date")
+        for b in cc_budgets:
+            active_budgets.setdefault(b.cost_center_id, b)
+        missing_cc_ids = [cid for cid in cc_ids if cid not in active_budgets]
+        if missing_cc_ids:
+            fallback_cc_budgets = Budget.objects.filter(
+                cost_center_id__in=missing_cc_ids,
+                fiscal_period__is_closed=False,
+            ).order_by("-fiscal_period__start_date")
+            for b in fallback_cc_budgets:
+                active_budgets.setdefault(b.cost_center_id, b)
+
+    for pr in pending_list:
+        b = active_budgets.get(pr.cost_center_id)
+        if pr.status == PurchaseRequisition.STATUS_BUDGET_REVIEW:
+            pr.is_over_budget = True
+        elif b and (b.available_amount <= 0 or pr.total_amount > b.available_amount):
+            pr.is_over_budget = True
+        elif (
+            b is None
+            and raw_available_budget <= 0
+            and has_open_period
+            and (user_department or getattr(user, "organization", None))
+        ):
+            pr.is_over_budget = True
+        else:
+            pr.is_over_budget = False
+
+    over_budget_in_pending = sum(1 for pr in pending_list if getattr(pr, "is_over_budget", False))
+    if over_budget_in_pending > budget_overrun_count:
+        budget_overrun_count = over_budget_in_pending
+    if budget_overrun_count > 0:
+        has_budget_overrun = True
 
     context = {
         "user_department": user_department,
@@ -504,26 +784,27 @@ def approver_dashboard_view(request):
             "pending_count": pending_prs_qs.count(),
             "approved_count": dept_prs.filter(status="APPROVED").count(),
             "available_budget": float(available_budget),
+            "is_budget_overdrawn": is_budget_overdrawn,
+            "budget_overrun_amount": float(budget_overrun_amount),
             "budget_overrun_count": budget_overrun_count,
         },
-        "pending_prs": pending_prs_qs[:10],
+        "pending_prs": pending_list,
     }
     return render(request, "pages/dashboards/approver_dashboard.html", context)
 
 
 @login_required(login_url="/login/")
+@dashboard_role_required([Role.SUPER_ADMIN])
 def superadmin_dashboard_view(request):
     user = request.user
     from apps.audit.models import AuditLog
     from apps.budgets.models import Budget
+    from apps.core.superadmin_views import get_user_scoped_org
     from apps.invoices.models import MatchException
     from apps.organization.models import Organization
 
-    from apps.core.superadmin_views import get_user_scoped_org
-
     scoped_org = get_user_scoped_org(user)
     is_global_superadmin = bool(not scoped_org and user.is_superuser)
-    can_add_organization = is_global_superadmin
 
     today = timezone.now().date()
     users_qs = User.objects.all()
@@ -569,6 +850,16 @@ def superadmin_dashboard_view(request):
             if is_global_superadmin
             else (1 if (scoped_org and scoped_org.is_active) else 0)
         ),
+        "inactive_organizations": (
+            Organization.objects.filter(is_active=False).count()
+            if is_global_superadmin
+            else (1 if (scoped_org and not scoped_org.is_active) else 0)
+        ),
+        "deactivated_organizations": (
+            Organization.objects.filter(is_active=False).count()
+            if is_global_superadmin
+            else (1 if (scoped_org and not scoped_org.is_active) else 0)
+        ),
         "provisioned_admins": (
             Organization.objects.filter(admin_user__isnull=False).count()
             if is_global_superadmin
@@ -590,6 +881,7 @@ def superadmin_dashboard_view(request):
 
 
 @login_required(login_url="/login/")
+@dashboard_role_required([Role.AUDITOR, Role.SUPER_ADMIN])
 def auditor_dashboard_view(request):
     from apps.audit.views import auditor_dashboard_view as aud_view
 
@@ -640,10 +932,28 @@ def _is_api_request(request):
     return request.path.startswith("/api/") or "application/json" in accept or "json" in accept
 
 
+@require_http_methods(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
+def custom_api_404_view(request, *args, **kwargs):
+    return JsonResponse(
+        {
+            "error": {
+                "code": "NOT_FOUND",
+                "message": "The requested API endpoint was not found.",
+                "details": {"path": request.path},
+            }
+        },
+        status=404,
+    )
+
+
 def custom_404_view(request, exception=None):
     if request.path == "/favicon.ico":
         from django.shortcuts import redirect
         return redirect("/static/icons/favicon.ico")
+
+    if request.path.lower() in ("/quit", "/quit/"):
+        from django.shortcuts import redirect
+        return redirect("/")
 
     # Auto-redirect non-slash URLs if the slashed path resolves (replaces default CommonMiddleware behavior bypassed by catch-all)
     if not request.path.endswith("/") and not _is_api_request(request):
@@ -736,11 +1046,7 @@ def protected_media_view(request, file_path):
     if normalized_path.startswith("..") or ".." in normalized_path.split(os.path.sep):
         return HttpResponseForbidden("Access denied: Invalid file path.")
 
-    full_path = os.path.join(settings.MEDIA_ROOT, normalized_path)
-    if not os.path.exists(full_path) or not os.path.isfile(full_path):
-        raise Http404("Document not found.")
-
-    # 2. RBAC and Ownership Enforcement
+    # 2. RBAC and Ownership Enforcement (evaluated before file existence to prevent enumeration & redirects)
     if user.is_superuser or role_code == Role.SUPER_ADMIN:
         pass  # Super Admin has full administrative access
     elif role_code == Role.VENDOR_USER:
@@ -764,10 +1070,14 @@ def protected_media_view(request, file_path):
         norm_lower = normalized_path.lower()
         if "contracts" in norm_lower:
             return HttpResponseForbidden("Access denied: Legal contracts are restricted to Legal and Procurement.")
-        if "vendor_docs" in norm_lower or "kyc" in norm_lower:
+        if "vendor_docs" in norm_lower or "vendor_documents" in norm_lower or "kyc" in norm_lower:
             return HttpResponseForbidden("Access denied: Vendor KYC records are restricted to Procurement and Legal.")
     elif role_code in [Role.PROC_EXEC, Role.PROC_MGR, Role.LEGAL_MGR, Role.FINANCE_AP, Role.AUDITOR]:
         pass
+
+    full_path = os.path.join(settings.MEDIA_ROOT, normalized_path)
+    if not os.path.exists(full_path) or not os.path.isfile(full_path):
+        raise Http404("Document not found.")
 
     content_type, _ = mimetypes.guess_type(full_path)
     filename = os.path.basename(full_path)
@@ -777,9 +1087,26 @@ def protected_media_view(request, file_path):
 
 
 def protected_vendor_document_view(request, file_path):
-    """Alias for backwards compatibility with vendor_documents specific route."""
+    """Alias for backwards compatibility with vendor_docs and vendor_documents specific routes."""
     import os
-    if not file_path.startswith("vendor_documents"):
-        file_path = os.path.join("vendor_documents", file_path)
-    return protected_media_view(request, file_path)
+
+    from django.conf import settings
+
+    norm_path = os.path.normpath(file_path).lstrip("/\\")
+    if norm_path.startswith("vendor_docs") or norm_path.startswith("vendor_documents"):
+        return protected_media_view(request, norm_path)
+
+    req_path = getattr(request, "path", "") or ""
+    preferred_dir = "vendor_docs" if "vendor_docs" in req_path else "vendor_documents"
+    alternate_dir = "vendor_documents" if preferred_dir == "vendor_docs" else "vendor_docs"
+
+    path_preferred = os.path.join(preferred_dir, norm_path)
+    path_alternate = os.path.join(alternate_dir, norm_path)
+
+    if os.path.exists(os.path.join(settings.MEDIA_ROOT, path_preferred)):
+        return protected_media_view(request, path_preferred)
+    if os.path.exists(os.path.join(settings.MEDIA_ROOT, path_alternate)):
+        return protected_media_view(request, path_alternate)
+
+    return protected_media_view(request, path_preferred)
 

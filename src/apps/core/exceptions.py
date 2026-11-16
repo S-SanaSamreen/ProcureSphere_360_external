@@ -1,4 +1,7 @@
+import decimal
+
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import DataError
 from django.db.models.deletion import ProtectedError
 from django.http import Http404
 from rest_framework import status
@@ -16,6 +19,26 @@ from rest_framework.response import Response
 from rest_framework.views import exception_handler
 
 
+def _get_active_request_id(context=None):
+    if context and "request" in context:
+        req = context["request"]
+        rid = getattr(req, "request_id", None) or getattr(req, "correlation_id", None)
+        if rid:
+            return str(rid)
+        header_rid = req.headers.get("X-Request-ID") if hasattr(req, "headers") else req.META.get("HTTP_X_REQUEST_ID")
+        if header_rid:
+            return str(header_rid)
+    try:
+        from apps.core.middleware import get_current_request_id
+        rid = get_current_request_id()
+        if rid:
+            return str(rid)
+    except Exception:
+        pass
+    import uuid
+    return str(uuid.uuid4())
+
+
 def custom_exception_handler(exc, context):
     """
     Custom DRF exception handler returning standardized JSON error structure:
@@ -23,10 +46,27 @@ def custom_exception_handler(exc, context):
         "error": {
             "code": "VALIDATION_ERROR",
             "message": "Human readable error summary",
-            "details": { ... field specific errors ... }
+            "details": { ... field specific errors ... },
+            "request_id": "...",
+            "fields": { ... }
         }
     }
     """
+    req_id = _get_active_request_id(context)
+
+    if isinstance(exc, (decimal.InvalidOperation, OverflowError, DataError, ValueError)):
+        return Response(
+            {
+                "error": {
+                    "code": "VALIDATION_ERROR",
+                    "message": "Invalid input format or numeric value out of bounds.",
+                    "details": str(exc),
+                    "request_id": req_id,
+                }
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
     if isinstance(exc, ProtectedError):
         protected_list = [str(obj) for obj in exc.protected_objects]
         return Response(
@@ -35,6 +75,44 @@ def custom_exception_handler(exc, context):
                     "code": "PROTECTED_ERROR",
                     "message": "Cannot delete record because it is referenced by other active entities.",
                     "details": {"protected_objects": protected_list},
+                    "request_id": req_id,
+                }
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    from django.db import IntegrityError
+    if isinstance(exc, IntegrityError):
+        err_str = str(exc).lower()
+        if "po_number" in err_str:
+            return Response(
+                {
+                    "error": {
+                        "code": "DUPLICATE_RESOURCE",
+                        "message": "A Purchase Order with this PO number already exists.",
+                        "details": {"po_number": ["Purchase Order with this PO number already exists."]},
+                    }
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        if "grn_number" in err_str or "delivery_note_number" in err_str:
+            return Response(
+                {
+                    "error": {
+                        "code": "DUPLICATE_RESOURCE",
+                        "message": "A Goods Receipt with this GRN or Delivery Note already exists.",
+                        "details": {"grn_number": ["Goods receipt with this identifier already exists."]},
+                    }
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(
+            {
+                "error": {
+                    "code": "INTEGRITY_ERROR",
+                    "message": "A record with this unique identifier or constrained attribute already exists.",
+                    "details": str(exc),
+                    "request_id": req_id,
                 }
             },
             status=status.HTTP_400_BAD_REQUEST,
@@ -100,31 +178,39 @@ def custom_exception_handler(exc, context):
             details = _clean_item(raw_data)
             message = str(exc)
 
-        if "ErrorDetail(" in message:
+        if "ErrorDetail(" in message or "[" in message:
+            import re
+            cleaned = re.sub(r"\[?ErrorDetail\(string=[\'\"](.*?)[\'\"](?:\s*,\s*code=[\'\"]\w+[\'\"])?\)[,\s\]]*", r"\1", message).strip("[]'\" ")
+            if cleaned:
+                message = cleaned
             import re
             m = re.search(r"""ErrorDetail\(string=['"](.*?)['"]""", message)
             if m:
                 message = m.group(1)
 
-        custom_response_data = {
-            "error": {
-                "code": error_code,
-                "message": message,
-                "details": details,
-            }
+        error_payload = {
+            "code": error_code,
+            "message": message,
+            "details": details,
+            "request_id": req_id,
         }
+        if isinstance(details, dict):
+            error_payload["fields"] = details
+        custom_response_data = {"error": error_payload}
         return Response(custom_response_data, status=status_code)
 
     import logging
+
     from django.conf import settings
 
     logger = logging.getLogger(__name__)
     logger.exception("Unhandled server error: %s", exc)
 
     # Sanitize exception details in production to prevent CWE-209 information disclosure
+    is_test_or_debug = getattr(settings, "DEBUG", False) or getattr(settings, "TESTING", False) or "test" in getattr(settings, "SETTINGS_MODULE", "")
     details = (
         str(exc)
-        if getattr(settings, "DEBUG", False)
+        if is_test_or_debug
         else "An unexpected error occurred. Please contact the system administrator."
     )
 
@@ -134,6 +220,7 @@ def custom_exception_handler(exc, context):
                 "code": "INTERNAL_SERVER_ERROR",
                 "message": "An unexpected internal server error occurred.",
                 "details": details,
+                "request_id": req_id,
             }
         },
         status=status.HTTP_500_INTERNAL_SERVER_ERROR,

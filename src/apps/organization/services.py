@@ -1,4 +1,5 @@
 from typing import Optional, Tuple
+
 from django.core.exceptions import ValidationError
 from django.db import transaction
 
@@ -9,22 +10,63 @@ from apps.audit.services import create_audit_log_service
 from apps.notifications.email_service import send_user_welcome_email
 
 from .models import CostCenter, Department, FiscalPeriod, Location, Organization
+from .validators import (
+    validate_org_address,
+    validate_org_admin_email,
+    validate_org_code,
+    validate_org_name,
+    validate_org_tax_identifier,
+)
 
 
 @transaction.atomic
 def create_organization_service(
-    *, name: str, code: str, tax_identifier: str = "", address: str = "", is_active: bool = True
+    *,
+    name: str,
+    code: str,
+    tax_identifier: str = "",
+    address: str = "",
+    is_active: bool = True,
+    actor=None,
+    request=None,
+    _skip_audit: bool = False,
 ) -> Organization:
     """
     Service layer function to create an Organization entity inside a database transaction.
+    Records an append-only AuditLog entry for successful organization creation.
     """
+    clean_code = validate_org_code(code)
+    clean_name = validate_org_name(name)
+    clean_tax = validate_org_tax_identifier(tax_identifier)
+    clean_address = validate_org_address(address)
+
     org = Organization.objects.create(
-        name=name.strip(),
-        code=code.strip().upper(),
-        tax_identifier=tax_identifier.strip(),
-        address=address.strip(),
+        name=clean_name,
+        code=clean_code,
+        tax_identifier=clean_tax,
+        address=clean_address,
         is_active=is_active,
     )
+
+    if not _skip_audit:
+        effective_actor = actor or (
+            request.user if request and getattr(request, "user", None) and request.user.is_authenticated else None
+        )
+        create_audit_log_service(
+            actor=effective_actor,
+            action=AuditLog.ACTION_CREATE,
+            target_model="Organization",
+            target_object_id=str(org.id),
+            previous_state=None,
+            new_state={
+                "name": org.name,
+                "code": org.code,
+                "tax_identifier": org.tax_identifier,
+                "is_active": org.is_active,
+            },
+            request=request,
+        )
+
     return org
 
 
@@ -62,13 +104,16 @@ def create_organization_with_admin_service(
         tax_identifier=tax_identifier,
         address=address,
         is_active=is_active,
+        actor=actor,
+        request=request,
+        _skip_audit=True,
     )
 
     admin_user = None
     raw_password = None
 
     if admin_email and admin_email.strip():
-        norm_email = admin_email.strip().lower()
+        norm_email = validate_org_admin_email(admin_email, is_create=True)
         role, _ = Role.objects.get_or_create(
             code=Role.SUPER_ADMIN,
             defaults={"name": "Super Admin", "description": "System and Organization Administrator"},
@@ -93,7 +138,7 @@ def create_organization_with_admin_service(
                 organization=org,
                 is_staff=False,
                 is_superuser=False,
-                is_active=True,
+                is_active=is_active,
                 must_change_password=True,
             )
             admin_user.set_password(raw_password)
@@ -114,7 +159,7 @@ def create_organization_with_admin_service(
             admin_user.role = role
             admin_user.is_staff = False
             admin_user.is_superuser = False
-            admin_user.is_active = True
+            admin_user.is_active = is_active
             if admin_password and admin_password.strip():
                 raw_password = admin_password.strip()
                 admin_user.set_password(raw_password)
@@ -168,9 +213,7 @@ def create_organization_with_admin_service(
             defaults={"name": "Procurement Manager", "description": "Dedicated Procurement Manager"},
         )
         proc_mgr_user = User.objects.filter(email__iexact=norm_pm_email).first()
-        is_new_pm = False
         if not proc_mgr_user:
-            is_new_pm = True
             raw_pm_pwd = (
                 proc_mgr_password.strip()
                 if proc_mgr_password and proc_mgr_password.strip()
@@ -185,7 +228,7 @@ def create_organization_with_admin_service(
                 organization=org,
                 is_staff=False,
                 is_superuser=False,
-                is_active=True,
+                is_active=is_active,
                 must_change_password=True,
             )
             proc_mgr_user.set_password(raw_pm_pwd)
@@ -198,6 +241,7 @@ def create_organization_with_admin_service(
             proc_mgr_user.role = pm_role
             proc_mgr_user.is_staff = False
             proc_mgr_user.is_superuser = False
+            proc_mgr_user.is_active = is_active
             if proc_mgr_password and proc_mgr_password.strip():
                 raw_pm_pwd = proc_mgr_password.strip()
                 proc_mgr_user.set_password(raw_pm_pwd)
@@ -222,9 +266,7 @@ def create_organization_with_admin_service(
             defaults={"name": "Compliance Auditor", "description": "Dedicated Compliance Auditor"},
         )
         auditor_user = User.objects.filter(email__iexact=norm_aud_email).first()
-        is_new_aud = False
         if not auditor_user:
-            is_new_aud = True
             raw_aud_pwd = (
                 auditor_password.strip()
                 if auditor_password and auditor_password.strip()
@@ -239,7 +281,7 @@ def create_organization_with_admin_service(
                 organization=org,
                 is_staff=False,
                 is_superuser=False,
-                is_active=True,
+                is_active=is_active,
                 must_change_password=True,
             )
             auditor_user.set_password(raw_aud_pwd)
@@ -252,6 +294,7 @@ def create_organization_with_admin_service(
             auditor_user.role = aud_role
             auditor_user.is_staff = False
             auditor_user.is_superuser = False
+            auditor_user.is_active = is_active
             if auditor_password and auditor_password.strip():
                 raw_aud_pwd = auditor_password.strip()
                 auditor_user.set_password(raw_aud_pwd)
@@ -425,11 +468,14 @@ def create_location_service(
     Service layer function to create an Organization Location inside a database transaction.
     """
     norm_code = code.strip().upper()
+    city_clean = (city or "").strip()
+    if not city_clean:
+        raise ValidationError("City is mandatory for location.")
     loc = Location.objects.create(
         organization=organization,
         name=name.strip(),
         code=norm_code,
-        city=city.strip(),
+        city=city_clean,
         country=country.strip() or "India",
         address=address.strip(),
         is_active=is_active,
@@ -476,9 +522,12 @@ def update_location_service(
         "address": location.address,
         "is_active": location.is_active,
     }
+    city_clean = (city or "").strip()
+    if not city_clean:
+        raise ValidationError("City is mandatory for location.")
     location.name = name.strip()
     location.code = code.strip().upper()
-    location.city = city.strip()
+    location.city = city_clean
     location.country = country.strip() or "India"
     location.address = address.strip()
     location.is_active = is_active

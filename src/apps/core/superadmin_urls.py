@@ -1,17 +1,37 @@
 
 from django.urls import path
 
+from apps.invoices.views import tolerance_settings_view
+from apps.notifications.views import notification_list_view
+from apps.reports.views import reports_hub_view
+from apps.vendors.views import vendor_list_view
+
 from . import superadmin_views
 
 app_name = "superadmin"
 
 urlpatterns = [
     path("", superadmin_views.superadmin_home_view, name="home"),
+    path("dashboard/", superadmin_views.superadmin_home_view, name="dashboard"),
+
+    # Notifications & Alerts
+    path("notifications/", notification_list_view, name="notifications"),
+
+    # Reports & Analytics
+    path("reports/", reports_hub_view, name="reports"),
+
+    # Vendor Management
+    path("vendors/", vendor_list_view, name="vendors"),
+
+    # Business Rules
+    path("rules/", tolerance_settings_view, name="rules"),
+    path("business-rules/", tolerance_settings_view, name="business_rules"),
 
     # User management
     path("users/", superadmin_views.user_list_view, name="users"),
     path("users/create/", superadmin_views.user_create_view, name="user_create"),
     path("users/<uuid:user_id>/edit/", superadmin_views.user_edit_view, name="user_edit"),
+    path("users/<uuid:user_id>/delete/", superadmin_views.user_delete_view, name="user_delete"),
     path("users/<uuid:user_id>/resend-welcome/", superadmin_views.user_resend_welcome_email_view, name="user_resend_welcome"),
     path("users/<uuid:user_id>/toggle-status/", superadmin_views.user_toggle_status_view, name="user_toggle_status"),
 
@@ -33,8 +53,10 @@ urlpatterns = [
     # Department and cost center management
     path("departments/create/", superadmin_views.dept_create_view, name="dept_create"),
     path("departments/<uuid:dept_id>/edit/", superadmin_views.dept_edit_view, name="dept_edit"),
+    path("departments/<uuid:dept_id>/delete/", superadmin_views.dept_delete_view, name="dept_delete"),
     path("cost-centers/create/", superadmin_views.cost_center_create_view, name="cost_center_create"),
     path("cost-centers/<uuid:cc_id>/edit/", superadmin_views.cost_center_edit_view, name="cost_center_edit"),
+    path("cost-centers/<uuid:cc_id>/delete/", superadmin_views.cost_center_delete_view, name="cost_center_delete"),
     path("cost-centers/options/", superadmin_views.cost_center_options_view, name="cost_center_options"),
 
     # Budget management
@@ -56,4 +78,8 @@ urlpatterns = [
     # Audit management
     path("audit/", superadmin_views.audit_list_view, name="audit"),
     path("audit/export/", superadmin_views.audit_export_view, name="audit_export"),
+
+    # Contact Enquiries
+    path("contact-enquiries/", superadmin_views.contact_enquiry_list_view, name="contact_enquiries"),
+    path("contact-enquiries/<uuid:enquiry_id>/status/", superadmin_views.contact_enquiry_status_view, name="contact_enquiry_status"),
 ]

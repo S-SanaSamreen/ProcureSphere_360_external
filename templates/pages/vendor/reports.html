@@ -29,7 +29,7 @@
     <!-- Navigation Tabs -->
     <div class="card glass-card border-0 shadow-sm mb-4">
         <div class="card-body p-3">
-            <ul class="nav nav-pills gap-2 flex-wrap">
+            <ul class="nav nav-pills vendor-scrollable-pills flex-nowrap overflow-x-auto gap-2">
                 <li class="nav-item">
                     <a class="nav-link rounded-pill px-3 py-1 small fw-semibold {% if tab == 'bids' %}active{% else %}text-secondary{% endif %}" href="?tab=bids">
                         <i class="fa-solid fa-file-invoice-dollar me-1"></i> Bid Lifecycle History
@@ -87,7 +87,7 @@
                             <td class="ps-4 font-monospace fw-bold text-primary">{{ bid.bid_number }}</td>
                             <td class="fw-semibold text-dark">{{ bid.event.event_number }}</td>
                             <td><span class="badge bg-secondary rounded-pill">V{{ bid.version }} ({{ bid.versions.count }} snapshots)</span></td>
-                            <td class="fw-bold text-dark">${{ bid.total_bid_amount|floatformat:2 }}</td>
+                            <td class="fw-bold text-dark">₹{{ bid.total_bid_amount|floatformat:2 }}</td>
                             <td class="small text-muted">{{ bid.created_at|date:"M d, Y" }}</td>
                             <td class="small text-muted">{{ bid.submitted_at|date:"M d, Y H:i"|default:"Draft" }}</td>
                             <td><span class="badge bg-info text-dark">{{ bid.status }}</span></td>
@@ -177,7 +177,7 @@
                         <tr>
                             <td class="ps-4 font-monospace fw-bold text-primary">{{ po.po_number }}</td>
                             <td class="small text-muted">{{ po.po_date|date:"M d, Y" }}</td>
-                            <td class="fw-bold text-dark">${{ po.total_amount|floatformat:2 }}</td>
+                            <td class="fw-bold text-dark">₹{{ po.total_amount|floatformat:2 }}</td>
                             <td><span class="badge bg-primary">{{ po.status }}</span></td>
                             <td class="small text-muted">{{ po.acknowledged_at|date:"M d, Y H:i"|default:"Pending" }}</td>
                             <td class="small text-muted">{{ po.created_at|date:"M d, Y" }}</td>
