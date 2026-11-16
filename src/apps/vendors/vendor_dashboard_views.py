@@ -8,10 +8,12 @@ from django.contrib import messages
 from django.contrib.auth import update_session_auth_hash
 from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import PermissionDenied, ValidationError
-from django.db.models import Q, Sum
+from django.db import transaction
+from django.db.models import Count, Q, Sum
 from django.http import FileResponse, Http404, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
+from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_POST
 
 from apps.accounts.models import Role
@@ -21,7 +23,10 @@ from apps.invoices.models import InvoiceLine, SupplierInvoice
 from apps.invoices.services import create_supplier_invoice_service
 from apps.notifications.models import Notification
 from apps.orders.models import PurchaseOrder
-from apps.orders.services import acknowledge_purchase_order_service
+from apps.orders.services import (
+    acknowledge_purchase_order_service,
+    vendor_reject_purchase_order_service,
+)
 from apps.requisitions.models import PRAttachment
 from apps.scorecards.models import VendorScorecard
 from apps.sourcing.models import (
@@ -59,6 +64,17 @@ from apps.vendors.services import (
 )
 
 
+def _safe_next_url(request, default="vendor_profile"):
+    next_url = request.POST.get("next")
+    if next_url and url_has_allowed_host_and_scheme(
+        url=next_url,
+        allowed_hosts={request.get_host()},
+        require_https=request.is_secure(),
+    ):
+        return next_url
+    return default
+
+
 def vendor_required(view_func):
     """
     Decorator enforcing that:
@@ -73,20 +89,23 @@ def vendor_required(view_func):
         if not request.user or not request.user.is_authenticated:
             return redirect(f"/login/?next={request.path}")
 
-        role_code = getattr(request.user, "role_code", None)
-        if not (request.user.is_superuser or role_code == Role.VENDOR_USER):
+        role_code = getattr(request.user, "role_code", None) or (
+            request.user.role.code if getattr(request.user, "role", None) else None
+        )
+        is_admin = request.user.is_superuser or role_code in [Role.SUPER_ADMIN, "SUPER_ADMIN"]
+        if not (is_admin or role_code == Role.VENDOR_USER):
             raise PermissionDenied(
                 "Access restricted: Only registered Vendor Portal users are permitted."
             )
 
         vendor = getattr(request.user, "vendor", None)
-        if not vendor and not request.user.is_superuser:
+        if not vendor and not is_admin:
             raise PermissionDenied(
                 "Vendor user account is not linked to an active Vendor company entity."
             )
 
         # For superuser testing without vendor, retrieve or attach first active vendor if exists
-        if not vendor and request.user.is_superuser:
+        if not vendor and is_admin:
             vendor = Vendor.objects.first()
 
         request.vendor = vendor
@@ -161,12 +180,21 @@ def vendor_dashboard_overview_view(request):
         "-created_at"
     )[:5]
 
+    # Section G: Latest Supplier Scorecard & Performance
+    latest_scorecard = (
+        VendorScorecard.objects.filter(vendor=vendor)
+        .prefetch_related("sla_metrics")
+        .order_by("-created_at")
+        .first()
+    )
+
     onboarding = get_vendor_onboarding_progress(vendor)
 
     context = {
         "vendor": vendor,
         "metrics": metrics,
         "onboarding": onboarding,
+        "latest_scorecard": latest_scorecard,
         "recent_invitations": recent_invitations,
         "upcoming_events": upcoming_events,
         "recent_bids": recent_bids,
@@ -220,48 +248,115 @@ def vendor_profile_view(request):
             return redirect("vendor_profile")
 
         elif action == "upload_kyc":
-            doc_file = request.FILES.get("kyc_file")
-            doc_type = request.POST.get("document_type", VendorDocument.DOC_TYPE_OTHER)
-            title = request.POST.get("title", "").strip()
-            expiry_date_val = request.POST.get("expiry_date", "").strip() or None
+            # Check if this is a mandatory multi-document bundle upload (PAN, TAX, BANK + optional Other)
+            is_bundle = (
+                request.POST.get("upload_mode") == "mandatory_bundle"
+                or "pan_file" in request.FILES
+                or "tax_file" in request.FILES
+                or "bank_file" in request.FILES
+            )
 
-            if not doc_file:
-                messages.error(request, "Please select a valid document file to upload.")
-            else:
-                try:
-                    # Enforce document-only upload restrictions (reject image formats)
-                    file_name = getattr(doc_file, "name", "")
+            if is_bundle:
+                pan_file = request.FILES.get("pan_file")
+                tax_file = request.FILES.get("tax_file")
+                bank_file = request.FILES.get("bank_file")
+                other_file = request.FILES.get("other_file")
+
+                # Validation 1: All three mandatory documents must be selected
+                missing_fields = []
+                if not pan_file:
+                    missing_fields.append("PAN Document is mandatory. Please select your PAN Card file.")
+                if not tax_file:
+                    missing_fields.append("TAX Document is mandatory. Please select your GST or Tax Certificate.")
+                if not bank_file:
+                    missing_fields.append("BANK Document is mandatory. Please select your Bank Account Proof or Cancelled Cheque.")
+
+                if missing_fields:
+                    for err in missing_fields:
+                        messages.error(request, err)
+                    return redirect(_safe_next_url(request))
+
+                # Prepare documents list for validation and atomic upload
+                files_to_process = [
+                    (
+                        "PAN Document",
+                        pan_file,
+                        VendorDocument.DOC_TYPE_PAN,
+                        request.POST.get("pan_title", "").strip() or f"PAN Card - {vendor.legal_name}",
+                        request.POST.get("pan_expiry", "").strip() or None,
+                    ),
+                    (
+                        "TAX Document",
+                        tax_file,
+                        VendorDocument.DOC_TYPE_GST,
+                        request.POST.get("tax_title", "").strip() or f"GST / Tax Certificate - {vendor.legal_name}",
+                        request.POST.get("tax_expiry", "").strip() or None,
+                    ),
+                    (
+                        "BANK Document",
+                        bank_file,
+                        VendorDocument.DOC_TYPE_BANK,
+                        request.POST.get("bank_title", "").strip() or f"Bank Proof - {vendor.legal_name}",
+                        request.POST.get("bank_expiry", "").strip() or None,
+                    ),
+                ]
+
+                if other_file:
+                    other_type = request.POST.get("other_doc_type", VendorDocument.DOC_TYPE_OTHER)
+                    other_title = request.POST.get("other_title", "").strip() or f"Supporting Document - {other_file.name}"
+                    other_expiry = request.POST.get("other_expiry", "").strip() or None
+                    files_to_process.append(("Other Document", other_file, other_type, other_title, other_expiry))
+
+                DISALLOWED_IMAGE_EXTENSIONS = {
+                    "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "tiff", "ico", "avif", "heic", "heif"
+                }
+                SUPPORTED_DOCUMENT_EXTENSIONS = {"pdf", "doc", "docx", "xlsx", "csv"}
+                MAX_FILE_SIZE = 10 * 1024 * 1024
+
+                validation_errors = []
+                for label, f, _, _, _ in files_to_process:
+                    file_name = getattr(f, "name", "")
+                    file_size = getattr(f, "size", 0) or 0
                     ext = os.path.splitext(file_name)[1][1:].lower() if "." in file_name else ""
-                    raw_content_type = (getattr(doc_file, "content_type", "") or "").split(";")[0].strip().lower()
+                    raw_content_type = (getattr(f, "content_type", "") or "").split(";")[0].strip().lower()
 
-                    DISALLOWED_IMAGE_EXTENSIONS = {
-                        "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "tiff", "ico", "avif"
-                    }
-                    SUPPORTED_DOCUMENT_EXTENSIONS = {"pdf", "doc", "docx", "xlsx", "csv"}
+                    if file_size == 0:
+                        validation_errors.append(f"{label}: Uploaded file '{file_name}' is empty (0 bytes).")
+                    elif file_size > MAX_FILE_SIZE:
+                        validation_errors.append(f"{label}: File '{file_name}' exceeds the maximum allowed limit of 10 MB.")
 
-                    if ext in DISALLOWED_IMAGE_EXTENSIONS or raw_content_type.startswith("image/"):
-                        raise ValidationError(
-                            f"Image files (.{ext or 'image'}) are not supported for KYC compliance documents. "
-                            "Please upload supported document files only (PDF, DOC, DOCX, XLSX, CSV)."
+                    if (ext in DISALLOWED_IMAGE_EXTENSIONS) or raw_content_type.startswith("image/"):
+                        validation_errors.append(
+                            f"{label}: Image files (.{ext or 'image'}) are strictly prohibited. Please upload a supported document format (PDF, DOC, DOCX, XLSX, CSV)."
+                        )
+                    elif ext not in SUPPORTED_DOCUMENT_EXTENSIONS:
+                        validation_errors.append(
+                            f"{label}: File extension '.{ext}' is not permitted. Only PDF, DOC, DOCX, XLSX, CSV are allowed."
                         )
 
-                    if ext not in SUPPORTED_DOCUMENT_EXTENSIONS:
-                        raise ValidationError(
-                            f"File extension '.{ext}' is not permitted. "
-                            "Please upload a supported document file (PDF, DOC, DOCX, XLSX, CSV)."
-                        )
+                if validation_errors:
+                    for err in validation_errors:
+                        messages.error(request, err)
+                    return redirect(_safe_next_url(request))
 
-                    upload_vendor_document_service(
-                        vendor=vendor,
-                        user=request.user,
-                        file=doc_file,
-                        document_type=doc_type,
-                        title=title,
-                        expiry_date=expiry_date_val,
-                    )
+                # Validation passed: Upload all documents atomically
+                try:
+                    with transaction.atomic():
+                        for label, f, doc_type, title, expiry in files_to_process:
+                            upload_vendor_document_service(
+                                vendor=vendor,
+                                user=request.user,
+                                file=f,
+                                document_type=doc_type,
+                                title=title,
+                                expiry_date=expiry,
+                            )
                     messages.success(
-                        request, f"KYC document '{title or doc_file.name}' uploaded successfully."
+                        request,
+                        "All 3 mandatory KYC documents (PAN, TAX, BANK) uploaded successfully and submitted for compliance verification."
                     )
+                    if other_file:
+                        messages.success(request, f"Supporting document '{other_file.name}' uploaded successfully.")
                 except ValidationError as e:
                     msg = (
                         e.message
@@ -269,12 +364,66 @@ def vendor_profile_view(request):
                         else (e.messages[0] if hasattr(e, "messages") and e.messages else str(e))
                     )
                     messages.error(request, f"Upload validation failed: {msg}")
-                except Exception:
-                    messages.error(
-                        request, "Document upload failed. Please verify the file and try again."
-                    )
-            next_url = request.POST.get("next")
-            return redirect(next_url if next_url else "vendor_profile")
+                except Exception as e:
+                    messages.error(request, f"Document upload failed: {str(e)}")
+
+                return redirect(_safe_next_url(request))
+
+            else:
+                # Legacy single-file upload (preserves compatibility for individual endpoints/tests)
+                doc_file = request.FILES.get("kyc_file")
+                doc_type = request.POST.get("document_type", VendorDocument.DOC_TYPE_OTHER)
+                title = request.POST.get("title", "").strip()
+                expiry_date_val = request.POST.get("expiry_date", "").strip() or None
+
+                if not doc_file:
+                    messages.error(request, "Please select a valid document file to upload.")
+                else:
+                    try:
+                        file_name = getattr(doc_file, "name", "")
+                        ext = os.path.splitext(file_name)[1][1:].lower() if "." in file_name else ""
+                        raw_content_type = (getattr(doc_file, "content_type", "") or "").split(";")[0].strip().lower()
+
+                        DISALLOWED_IMAGE_EXTENSIONS = {
+                            "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "tiff", "ico", "avif", "heic", "heif"
+                        }
+                        SUPPORTED_DOCUMENT_EXTENSIONS = {"pdf", "doc", "docx", "xlsx", "csv"}
+
+                        if (ext in DISALLOWED_IMAGE_EXTENSIONS) or raw_content_type.startswith("image/"):
+                            raise ValidationError(
+                                f"Image file format (.{ext or 'image'}) is strictly prohibited. "
+                                "Please upload a supported document format (PDF, DOC, DOCX, XLSX, CSV)."
+                            )
+
+                        if ext not in SUPPORTED_DOCUMENT_EXTENSIONS:
+                            raise ValidationError(
+                                f"File extension '.{ext}' is not permitted. "
+                                "Please upload a supported document file (PDF, DOC, DOCX, XLSX, CSV)."
+                            )
+
+                        upload_vendor_document_service(
+                            vendor=vendor,
+                            user=request.user,
+                            file=doc_file,
+                            document_type=doc_type,
+                            title=title,
+                            expiry_date=expiry_date_val,
+                        )
+                        messages.success(
+                            request, f"KYC document '{title or doc_file.name}' uploaded successfully."
+                        )
+                    except ValidationError as e:
+                        msg = (
+                            e.message
+                            if hasattr(e, "message")
+                            else (e.messages[0] if hasattr(e, "messages") and e.messages else str(e))
+                        )
+                        messages.error(request, f"Upload validation failed: {msg}")
+                    except Exception:
+                        messages.error(
+                            request, "Document upload failed. Please verify the file and try again."
+                        )
+                return redirect(_safe_next_url(request))
 
         elif action == "submit_kyc":
             if not vendor.documents.exists():
@@ -312,7 +461,7 @@ def vendor_profile_view(request):
         elif action == "edit_contact":
             contact_id = request.POST.get("contact_id")
             contact = get_object_or_404(VendorContact, pk=contact_id, vendor=vendor)
-            form = VendorContactForm(request.POST)
+            form = VendorContactForm(request.POST, contact=contact)
             if not form.is_valid():
                 for field, error_list in form.errors.items():
                     for err in error_list:
@@ -355,6 +504,14 @@ def vendor_profile_view(request):
         .select_related("verified_by")
         .order_by("-created_at")
     )
+    doc_pan = documents.filter(document_type=VendorDocument.DOC_TYPE_PAN).first()
+    doc_tax = documents.filter(document_type__in=[VendorDocument.DOC_TYPE_GST, VendorDocument.DOC_TYPE_TAX]).first()
+    doc_bank = documents.filter(document_type=VendorDocument.DOC_TYPE_BANK).first()
+    doc_other_list = documents.exclude(
+        document_type__in=[VendorDocument.DOC_TYPE_PAN, VendorDocument.DOC_TYPE_GST, VendorDocument.DOC_TYPE_TAX, VendorDocument.DOC_TYPE_BANK]
+    )
+    has_all_mandatory_docs = bool(doc_pan and doc_tax and doc_bank)
+
     contacts = vendor.contacts.order_by("-is_primary", "first_name")
     onboarding = get_vendor_onboarding_progress(vendor)
     risk_records = vendor.risk_records.select_related("assessed_by").order_by("-created_at")
@@ -376,6 +533,11 @@ def vendor_profile_view(request):
         "vendor": vendor,
         "phone_digits": phone_digits,
         "documents": documents,
+        "doc_pan": doc_pan,
+        "doc_tax": doc_tax,
+        "doc_bank": doc_bank,
+        "doc_other_list": doc_other_list,
+        "has_all_mandatory_docs": has_all_mandatory_docs,
         "contacts": contacts,
         "onboarding": onboarding,
         "risk_records": risk_records,
@@ -475,30 +637,30 @@ def vendor_sourcing_list_view(request):
             }
         )
 
-    # Counts for tabs
-    tab_counts = {
-        "all": BidInvite.objects.exclude(event__status=SourcingEvent.STATUS_DRAFT)
-        .filter(vendor=vendor)
-        .count(),
-        "active": BidInvite.objects.exclude(event__status=SourcingEvent.STATUS_DRAFT)
-        .filter(
-            vendor=vendor,
-            event__status__in=[SourcingEvent.STATUS_BID_WINDOW, SourcingEvent.STATUS_PUBLISHED],
-            event__bid_end_date__gte=now,
-        )
-        .count(),
-        "closing": BidInvite.objects.exclude(event__status=SourcingEvent.STATUS_DRAFT)
-        .filter(
-            vendor=vendor,
-            event__status__in=[SourcingEvent.STATUS_BID_WINDOW, SourcingEvent.STATUS_PUBLISHED],
-            event__bid_end_date__gte=now,
-            event__bid_end_date__lte=now + timedelta(days=3),
-        )
-        .count(),
-        "closed": BidInvite.objects.exclude(event__status=SourcingEvent.STATUS_DRAFT)
-        .filter(vendor=vendor)
-        .filter(
-            Q(
+    # Single aggregate query for all tabs (replaces 4 sequential count queries)
+    base_invites_qs = BidInvite.objects.exclude(
+        event__status=SourcingEvent.STATUS_DRAFT
+    ).filter(vendor=vendor)
+    tab_counts = base_invites_qs.aggregate(
+        all=Count("id"),
+        active=Count(
+            "id",
+            filter=Q(
+                event__status__in=[SourcingEvent.STATUS_BID_WINDOW, SourcingEvent.STATUS_PUBLISHED],
+                event__bid_end_date__gte=now,
+            ),
+        ),
+        closing=Count(
+            "id",
+            filter=Q(
+                event__status__in=[SourcingEvent.STATUS_BID_WINDOW, SourcingEvent.STATUS_PUBLISHED],
+                event__bid_end_date__gte=now,
+                event__bid_end_date__lte=now + timedelta(days=3),
+            ),
+        ),
+        closed=Count(
+            "id",
+            filter=Q(
                 event__status__in=[
                     SourcingEvent.STATUS_TECHNICAL_REVIEW,
                     SourcingEvent.STATUS_COMMERCIAL_REVIEW,
@@ -507,10 +669,9 @@ def vendor_sourcing_list_view(request):
                     SourcingEvent.STATUS_CANCELLED,
                 ]
             )
-            | Q(event__bid_end_date__lt=now)
-        )
-        .count(),
-    }
+            | Q(event__bid_end_date__lt=now),
+        ),
+    )
 
     context = {
         "vendor": vendor,
@@ -636,6 +797,13 @@ def vendor_sourcing_participate_view(request, event_id):
     if not invite and not request.user.is_superuser:
         raise PermissionDenied("Access Denied: You do not hold an invitation for this event.")
 
+    if vendor.status != Vendor.STATUS_ACTIVE or not vendor.is_event_eligible:
+        messages.error(
+            request,
+            "Access Restricted: Sourcing participation is restricted to active, approved vendors.",
+        )
+        return redirect("vendor_sourcing_detail", event_id=event.id)
+
     try:
         sync_event_window_status(event=event)
     except Exception:
@@ -747,6 +915,13 @@ def vendor_bid_create_view(request, event_id):  # noqa: C901
         raise PermissionDenied(
             "Access Denied: You do not hold an invitation for this sourcing event."
         )
+
+    if vendor.status != Vendor.STATUS_ACTIVE or not vendor.is_event_eligible:
+        messages.error(
+            request,
+            "Access Restricted: Bidding is restricted to active, approved vendors.",
+        )
+        return redirect("vendor_sourcing_detail", event_id=event.id)
 
     now = timezone.now()
     try:
@@ -1284,31 +1459,80 @@ def vendor_purchase_orders_list_view(request):
                 PurchaseOrder.STATUS_PARTIAL_RECEIPT,
             ]
         )
+    elif tab == "accepted":
+        pos_qs = pos_qs.filter(
+            status__in=[
+                PurchaseOrder.STATUS_ACKNOWLEDGED,
+                PurchaseOrder.STATUS_PARTIAL_RECEIPT,
+                PurchaseOrder.STATUS_COMPLETED,
+            ]
+        )
+    elif tab == "rejected":
+        pos_qs = pos_qs.filter(
+            status=PurchaseOrder.STATUS_CANCELLED,
+            acknowledgement_notes__icontains="REJECTED",
+        )
+    elif tab == "cancelled":
+        pos_qs = pos_qs.filter(status=PurchaseOrder.STATUS_CANCELLED)
     elif tab == "amended":
         pos_qs = pos_qs.filter(amendments__isnull=False).distinct()
     elif tab == "completed":
         pos_qs = pos_qs.filter(status=PurchaseOrder.STATUS_COMPLETED)
 
-    tab_counts = {
-        "all": PurchaseOrder.objects.filter(vendor=vendor).count(),
-        "pending_ack": PurchaseOrder.objects.filter(
-            vendor=vendor, status=PurchaseOrder.STATUS_ISSUED
-        ).count(),
-        "active": PurchaseOrder.objects.filter(
-            vendor=vendor,
-            status__in=[
-                PurchaseOrder.STATUS_ISSUED,
-                PurchaseOrder.STATUS_ACKNOWLEDGED,
-                PurchaseOrder.STATUS_PARTIAL_RECEIPT,
-            ],
-        ).count(),
-        "amended": PurchaseOrder.objects.filter(vendor=vendor, amendments__isnull=False)
-        .distinct()
-        .count(),
-        "completed": PurchaseOrder.objects.filter(
-            vendor=vendor, status=PurchaseOrder.STATUS_COMPLETED
-        ).count(),
-    }
+    # Single aggregate query for all tabs (replaces 8 sequential count queries)
+    tab_counts = PurchaseOrder.objects.filter(vendor=vendor).aggregate(
+        all=Count("id", distinct=True),
+        pending_ack=Count(
+            "id",
+            distinct=True,
+            filter=Q(status=PurchaseOrder.STATUS_ISSUED),
+        ),
+        active=Count(
+            "id",
+            distinct=True,
+            filter=Q(
+                status__in=[
+                    PurchaseOrder.STATUS_ISSUED,
+                    PurchaseOrder.STATUS_ACKNOWLEDGED,
+                    PurchaseOrder.STATUS_PARTIAL_RECEIPT,
+                ]
+            ),
+        ),
+        accepted=Count(
+            "id",
+            distinct=True,
+            filter=Q(
+                status__in=[
+                    PurchaseOrder.STATUS_ACKNOWLEDGED,
+                    PurchaseOrder.STATUS_PARTIAL_RECEIPT,
+                    PurchaseOrder.STATUS_COMPLETED,
+                ]
+            ),
+        ),
+        rejected=Count(
+            "id",
+            distinct=True,
+            filter=Q(
+                status=PurchaseOrder.STATUS_CANCELLED,
+                acknowledgement_notes__icontains="REJECTED",
+            ),
+        ),
+        cancelled=Count(
+            "id",
+            distinct=True,
+            filter=Q(status=PurchaseOrder.STATUS_CANCELLED),
+        ),
+        amended=Count(
+            "id",
+            distinct=True,
+            filter=Q(amendments__isnull=False),
+        ),
+        completed=Count(
+            "id",
+            distinct=True,
+            filter=Q(status=PurchaseOrder.STATUS_COMPLETED),
+        ),
+    )
 
     context = {
         "vendor": vendor,
@@ -1492,6 +1716,41 @@ def vendor_purchase_order_acknowledge_view(request, po_id):
 
 @vendor_required
 @require_POST
+def vendor_purchase_order_reject_view(request, po_id):
+    """
+    PO Rejection Action:
+    Vendor rejects an issued PO with a mandatory rejection reason.
+    """
+    vendor = request.vendor
+    po = get_object_or_404(PurchaseOrder, id=po_id)
+
+    if po.vendor != vendor and not request.user.is_superuser:
+        raise PermissionDenied("Access Denied: Unauthorized rejection attempt.")
+
+    reason = request.POST.get("rejection_reason", "").strip()
+    if not reason:
+        messages.error(request, "A reason/justification is required to reject a Purchase Order.")
+        return redirect("vendor_purchase_order_detail", po_id=po.id)
+
+    try:
+        vendor_reject_purchase_order_service(
+            po=po,
+            vendor_user=request.user,
+            rejection_reason=reason,
+        )
+        messages.warning(request, f"Purchase Order {po.po_number} has been rejected.")
+    except ValidationError as ve:
+        messages.error(
+            request, f"Rejection Failed: {ve.message if hasattr(ve, 'message') else str(ve)}"
+        )
+    except Exception as e:
+        messages.error(request, f"System Error: {str(e)}")
+
+    return redirect("vendor_purchase_orders_list")
+
+
+@vendor_required
+@require_POST
 def vendor_purchase_order_deliver_view(request, po_id):
     """
     Vendor Deliver Goods Action:
@@ -1615,8 +1874,65 @@ ELIGIBLE_INVOICE_STATUSES = [
 @vendor_required
 def vendor_invoices_view(request):
     vendor = request.vendor
-    invoices = SupplierInvoice.objects.filter(vendor=vendor).order_by("-created_at")
-    from django.db.models import Q
+    # select_related("po") eliminates N+1 query when template renders invoice.po.id and invoice.po.po_number
+    invoices_qs = (
+        SupplierInvoice.objects.filter(vendor=vendor)
+        .select_related("po")
+        .order_by("-created_at")
+    )
+
+    tab = request.GET.get("tab", "all").strip().lower()
+    if tab == "pending":
+        filtered_invoices = invoices_qs.filter(
+            status__in=[
+                SupplierInvoice.STATUS_RECEIVED,
+                SupplierInvoice.STATUS_VALIDATION,
+                SupplierInvoice.STATUS_MATCHING,
+                SupplierInvoice.STATUS_APPROVAL,
+            ]
+        )
+    elif tab == "approved":
+        filtered_invoices = invoices_qs.filter(
+            status=SupplierInvoice.STATUS_READY_FOR_PAYMENT
+        )
+    elif tab == "paid":
+        filtered_invoices = invoices_qs.filter(status=SupplierInvoice.STATUS_PAID)
+    elif tab == "exceptions":
+        filtered_invoices = invoices_qs.filter(
+            Q(status=SupplierInvoice.STATUS_EXCEPTION)
+            | ~Q(correction_request_notes="")
+        )
+    elif tab == "rejected":
+        filtered_invoices = invoices_qs.filter(status=SupplierInvoice.STATUS_REJECTED)
+    else:
+        filtered_invoices = invoices_qs
+
+    # Single aggregate query for all tabs (replaces 6 sequential count queries)
+    counts = invoices_qs.aggregate(
+        all=Count("id"),
+        pending=Count(
+            "id",
+            filter=Q(
+                status__in=[
+                    SupplierInvoice.STATUS_RECEIVED,
+                    SupplierInvoice.STATUS_VALIDATION,
+                    SupplierInvoice.STATUS_MATCHING,
+                    SupplierInvoice.STATUS_APPROVAL,
+                ]
+            ),
+        ),
+        approved=Count(
+            "id", filter=Q(status=SupplierInvoice.STATUS_READY_FOR_PAYMENT)
+        ),
+        paid=Count("id", filter=Q(status=SupplierInvoice.STATUS_PAID)),
+        exceptions=Count(
+            "id",
+            filter=Q(status=SupplierInvoice.STATUS_EXCEPTION)
+            | ~Q(correction_request_notes=""),
+        ),
+        rejected=Count("id", filter=Q(status=SupplierInvoice.STATUS_REJECTED)),
+    )
+
     eligible_pos = PurchaseOrder.objects.filter(
         vendor=vendor
     ).filter(
@@ -1626,10 +1942,29 @@ def vendor_invoices_view(request):
     context = {
         "vendor": vendor,
         "active_nav": "invoices",
-        "invoices": invoices,
+        "invoices": filtered_invoices,
         "eligible_pos": eligible_pos,
+        "tab": tab,
+        "counts": counts,
     }
     return render(request, "pages/vendor/invoices.html", context)
+
+
+@vendor_required
+def vendor_invoice_detail_view(request, invoice_id):
+    vendor = request.vendor
+    invoice = get_object_or_404(
+        SupplierInvoice.objects.select_related("po", "vendor")
+        .prefetch_related("lines__po_line", "exceptions"),
+        id=invoice_id,
+        vendor=vendor,
+    )
+    context = {
+        "vendor": vendor,
+        "active_nav": "invoices",
+        "invoice": invoice,
+    }
+    return render(request, "pages/vendor/invoice_detail.html", context)
 
 
 @vendor_required
@@ -1704,6 +2039,7 @@ def vendor_invoice_submit_view(request, po_id=None):
     invoice_date = request.POST.get("invoice_date")
     due_date = request.POST.get("due_date")
     notes = request.POST.get("notes", "").strip()
+    invoice_doc = request.FILES.get("invoice_document")
 
     if not invoice_number or not invoice_date or not due_date:
         messages.error(request, "Invoice number, date, and due date are required.")
@@ -1742,7 +2078,10 @@ def vendor_invoice_submit_view(request, po_id=None):
             due_date=due_date,
             line_items=line_items,
             notes=notes,
-            created_by_user=request.user
+            created_by_user=request.user,
+            invoice_document=invoice_doc,
+            require_grn=True,
+            enforce_billable_limits=False,
         )
         try:
             from apps.invoices.services import run_3_way_match_service
@@ -1763,7 +2102,7 @@ def vendor_invoice_submit_view(request, po_id=None):
     except Exception as e:
         messages.error(request, f"Failed to submit invoice: {str(e)}")
 
-    return redirect("vendor_purchase_order_detail", po_id=po.id)
+    return redirect("vendor_invoices")
 
 
 @vendor_required
@@ -1861,6 +2200,16 @@ def vendor_document_download_view(request, doc_type, doc_id):
             )
         file_handle = att.file
 
+    elif doc_type == "contract":
+        from apps.contracts.models import ContractDocument
+
+        doc = get_object_or_404(ContractDocument.objects.select_related("contract"), id=doc_id)
+        if doc.contract.vendor != vendor and not request.user.is_superuser:
+            raise PermissionDenied(
+                "Access Denied: You do not have permission to access this contract document."
+            )
+        file_handle = doc.file
+
     else:
         raise Http404("Document type not found.")
 
@@ -1874,9 +2223,9 @@ def vendor_document_download_view(request, doc_type, doc_id):
     AuditLog.objects.create(
         actor=request.user,
         action=AuditLog.ACTION_EXPORT,
-        target_model="PRAttachment"
-        if doc_type == "event"
-        else ("BidAttachment" if doc_type == "bid" else "VendorDocument"),
+        target_model="ContractDocument"
+        if doc_type == "contract"
+        else ("PRAttachment" if doc_type == "event" else ("BidAttachment" if doc_type == "bid" else "VendorDocument")),
         target_object_id=str(doc_id),
         new_state={
             "document_type": doc_type,

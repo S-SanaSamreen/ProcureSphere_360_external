@@ -2,11 +2,13 @@ from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.core.paginator import Paginator
+from django.db.models import Q
 from django.http import FileResponse, Http404
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
 from django.views.decorators.http import require_POST
 
+from apps.accounts.models import Role
 from apps.audit.models import AuditLog
 from apps.vendors.models import VendorCategory
 
@@ -37,6 +39,7 @@ from .selectors import (
     get_invitation_rows,
     get_pending_onboarding_vendors,
     get_sourcing_dashboard_metrics,
+    get_sourcing_events_for_user,
     search_sourcing_events,
 )
 
@@ -69,10 +72,7 @@ STATUS_FILTERS = [
 
 def _get_user_org(user):
     if user and user.is_authenticated and not user.is_superuser:
-        if getattr(user, "department_id", None) and getattr(
-            user.department, "organization_id", None
-        ):
-            return user.department.organization
+        return getattr(user, "effective_organization", None)
     return None
 
 
@@ -93,8 +93,9 @@ def sourcing_list_view(request):
     services.sync_all_event_windows()
 
     params = request.GET.copy()
+    _base_events = get_sourcing_events_for_user(request.user)
     if params.get("status") == "EVALUATION":
-        events = get_all_sourcing_events().filter(
+        events = _base_events.filter(
             status__in=[
                 SourcingEvent.STATUS_TECHNICAL_REVIEW,
                 SourcingEvent.STATUS_COMMERCIAL_REVIEW,
@@ -103,7 +104,7 @@ def sourcing_list_view(request):
         params.pop("status")
         events = search_sourcing_events(events, params)
     else:
-        events = search_sourcing_events(get_all_sourcing_events(), params)
+        events = search_sourcing_events(_base_events, params)
 
     page = Paginator(events, PAGE_SIZE).get_page(request.GET.get("page"))
     qs = request.GET.copy()
@@ -114,7 +115,7 @@ def sourcing_list_view(request):
         {
             "page_obj": page,
             "events": page.object_list,
-            "metrics": get_sourcing_dashboard_metrics(),
+            "metrics": get_sourcing_dashboard_metrics(user=request.user),
             "status_filters": STATUS_FILTERS,
             "status_filter": request.GET.get("status", ""),
             "type_choices": SourcingEvent.EVENT_TYPE_CHOICES,
@@ -145,14 +146,30 @@ def _form_to_kwargs(cleaned):
 @login_required(login_url="/login/")
 def sourcing_create_view(request):
     _require_manage(request.user)
-    form = SourcingEventForm(request.POST or None)
+    if request.method == "POST":
+        form = SourcingEventForm(request.POST)
+    else:
+        form = SourcingEventForm()
     if request.method == "POST" and form.is_valid():
         try:
             event = services.create_sourcing_event_service(
-                **_form_to_kwargs(form.cleaned_data), created_by_user=request.user
+                **_form_to_kwargs(form.cleaned_data),
+                created_by_user=request.user,
+                enforce_future_start=True,
             )
         except ValidationError as exc:
-            form.add_error(None, exc)
+            if hasattr(exc, "messages"):
+                for m in exc.messages:
+                    if "deadline" in m.lower():
+                        form.add_error("bid_end_date", m)
+                    elif "start" in m.lower():
+                        form.add_error("bid_start_date", m)
+                    elif "weight" in m.lower():
+                        form.add_error("commercial_weight", m)
+                    else:
+                        form.add_error(None, m)
+            else:
+                form.add_error(None, exc)
         else:
             messages.success(
                 request,
@@ -175,10 +192,24 @@ def sourcing_edit_view(request, event_id):
     if request.method == "POST" and form.is_valid():
         try:
             services.update_draft_sourcing_event_service(
-                event=event, user=request.user, data=_form_to_kwargs(form.cleaned_data)
+                event=event,
+                user=request.user,
+                data=_form_to_kwargs(form.cleaned_data),
+                enforce_future_start=True,
             )
         except ValidationError as exc:
-            form.add_error(None, exc)
+            if hasattr(exc, "messages"):
+                for m in exc.messages:
+                    if "deadline" in m.lower():
+                        form.add_error("bid_end_date", m)
+                    elif "start" in m.lower():
+                        form.add_error("bid_start_date", m)
+                    elif "weight" in m.lower():
+                        form.add_error("commercial_weight", m)
+                    else:
+                        form.add_error(None, m)
+            else:
+                form.add_error(None, exc)
         else:
             messages.success(request, f"{event.event_number} updated.")
             return redirect("sourcing_detail", event_id=event.id)
@@ -269,14 +300,21 @@ def sourcing_detail_view(request, event_id):
         SourcingEvent.STATUS_PUBLISHED,
         SourcingEvent.STATUS_BID_WINDOW,
     )
+    scoped_org = None if request.user.is_superuser else getattr(request.user, "effective_organization", None)
     eligible_vendors = []
     if can_invite:
         eligible_vendors = get_eligible_vendors_for_event(
-            event, category_id=request.GET.get("inv_cat") or None, q=request.GET.get("inv_q", "")
+            event,
+            category_id=request.GET.get("inv_cat") or None,
+            q=request.GET.get("inv_q", ""),
+            organization=scoped_org,
         )[:100]
     pending_vendors = (
         get_pending_onboarding_vendors(
-            event, category_id=request.GET.get("inv_cat") or None, q=request.GET.get("inv_q", "")
+            event,
+            category_id=request.GET.get("inv_cat") or None,
+            q=request.GET.get("inv_q", ""),
+            organization=scoped_org,
         )[:50]
         if can_invite
         else []
@@ -338,6 +376,11 @@ def sourcing_detail_view(request, event_id):
         "audit_trail": _event_audit_trail(event),
         "is_deadline_passed": event.bid_end_date < timezone.now(),
     }
+    role_code = getattr(request.user, "role_code", None) or (
+        request.user.role.code if getattr(request.user, "role", None) else None
+    )
+    if role_code in [Role.PROC_MGR, "PROC_MGR"]:
+        context["base_layout"] = "manager/base_manager.html"
     return render(request, "sourcing/sourcing_detail.html", context)
 
 
@@ -456,17 +499,6 @@ def _act_reject(event, request):
     return "Award recommendation rejected; event returned to commercial review."
 
 
-def _act_generate_po(event, request):
-    from apps.organization.models import CostCenter
-
-    cc_id = request.POST.get("cost_center_id")
-    cost_center = get_object_or_404(CostCenter, pk=cc_id) if cc_id else None
-    po = services.generate_po_from_award_service(
-        event=event, user=request.user, cost_center=cost_center
-    )
-    return f"Purchase Order {po.po_number} generated from the award."
-
-
 ACTIONS = {
     "publish": (_act_publish, "manage"),
     "close": (_act_close, "manage"),
@@ -481,7 +513,6 @@ ACTIONS = {
     "recommend-award": (_act_recommend, "manage"),
     "approve-award": (_act_approve, "approve"),
     "reject-award": (_act_reject, "approve"),
-    "generate-po": (_act_generate_po, "manage"),
 }
 
 ACTION_REDIRECTS = {
@@ -496,7 +527,6 @@ ACTION_REDIRECTS = {
     "recommend-award": ("evaluation_event", "award"),
     "approve-award": ("evaluation_event", "award"),
     "reject-award": ("evaluation_event", "award"),
-    "generate-po": ("evaluation_event", "award"),
 }
 
 
@@ -556,12 +586,21 @@ def bid_portal_dashboard_view(request):
     """Vendor Bid Portal dashboard: live bid windows and response tracking (sealed)."""
     _require_bid_access(request.user)
     services.sync_all_event_windows()
+    allowed_sizes = (10, 20, 50)
+    raw_size = (request.GET.get("per_page") or "").strip()
+    per_page = int(raw_size) if raw_size.isdigit() and int(raw_size) in allowed_sizes else PAGE_SIZE
+    page_obj = Paginator(get_bid_portal_events(), per_page).get_page(request.GET.get("page"))
+    querystring = f"per_page={per_page}" if per_page != PAGE_SIZE else ""
     return render(
         request,
         "sourcing/bid_portal_dashboard.html",
         {
             "metrics": get_bid_portal_metrics(),
-            "events": get_bid_portal_events(),
+            "events": page_obj.object_list,
+            "page_obj": page_obj,
+            "querystring": querystring,
+            "per_page": per_page,
+            "per_page_choices": list(allowed_sizes),
             "caps": sourcing_capabilities(request.user),
         },
     )
@@ -663,14 +702,30 @@ def sourcing_events_tab_view(request):
 def sourcing_event_create_htmx_view(request):
     """Pillar 2 HTMX modal: create SourcingEvent (weights + deadline) via service."""
     _require_manage(request.user)
-    form = SourcingEventForm(request.POST or None)
+    if request.method == "POST":
+        form = SourcingEventForm(request.POST)
+    else:
+        form = SourcingEventForm()
     if request.method == "POST" and form.is_valid():
         try:
             event = services.create_sourcing_event_service(
-                **_form_to_kwargs(form.cleaned_data), created_by_user=request.user
+                **_form_to_kwargs(form.cleaned_data),
+                created_by_user=request.user,
+                enforce_future_start=True,
             )
         except ValidationError as exc:
-            form.add_error(None, exc)
+            if hasattr(exc, "messages"):
+                for m in exc.messages:
+                    if "deadline" in m.lower():
+                        form.add_error("bid_end_date", m)
+                    elif "start" in m.lower():
+                        form.add_error("bid_start_date", m)
+                    elif "weight" in m.lower():
+                        form.add_error("commercial_weight", m)
+                    else:
+                        form.add_error(None, m)
+            else:
+                form.add_error(None, exc)
             return render(
                 request,
                 "sourcing/partials/htmx_event_create_modal.html",
@@ -750,12 +805,18 @@ def sourcing_invites_htmx_view(request, event_id):
             SourcingEvent.STATUS_BID_WINDOW,
         ),
         "eligible_vendors": (
-            get_eligible_vendors_for_event(event)[:100]
+            get_eligible_vendors_for_event(
+                event,
+                organization=None if request.user.is_superuser else getattr(request.user, "effective_organization", None),
+            )[:100]
             if sourcing_capabilities(request.user)["can_manage"]
             else []
         ),
         "pending_vendors": (
-            get_pending_onboarding_vendors(event)[:50]
+            get_pending_onboarding_vendors(
+                event,
+                organization=None if request.user.is_superuser else getattr(request.user, "effective_organization", None),
+            )[:50]
             if sourcing_capabilities(request.user)["can_manage"]
             else []
         ),
@@ -978,14 +1039,34 @@ def evaluation_event_view(request, event_id):
     from apps.organization.models import CostCenter
 
     _require_bid_access(request.user)
-    event = get_object_or_404(SourcingEvent.objects.select_related("requisition"), pk=event_id)
+    event = get_object_or_404(
+        SourcingEvent.objects.select_related("requisition__cost_center"),
+        pk=event_id,
+    )
     services.sync_event_window_status(event=event)
     if not event.bids_visible_to_evaluators:
         messages.info(request, "Evaluation opens after the bid window closes.")
         return redirect("bid_portal_event", event_id=event.id)
 
     rows = build_evaluation_rows(event, request.user)
-    purchase_orders = PurchaseOrder.objects.filter(sourcing_event=event).order_by("-created_at")
+    purchase_orders = (
+        PurchaseOrder.objects.filter(Q(sourcing_event=event) | Q(award__event=event))
+        .distinct()
+        .order_by("-created_at")
+    )
+
+    cost_centers = CostCenter.objects.none()
+    if event.status == SourcingEvent.STATUS_AWARDED:
+        cost_centers = CostCenter.objects.select_related("department").order_by("code")
+        from apps.organization.selectors import resolve_user_scope_organization
+
+        scoped_org = resolve_user_scope_organization(request.user)
+        if scoped_org:
+            cost_centers = cost_centers.filter(department__organization=scoped_org)
+
+    default_cost_center = (
+        event.requisition.cost_center if event.requisition_id else None
+    )
     return render(
         request,
         "sourcing/evaluation_event.html",
@@ -1004,11 +1085,8 @@ def evaluation_event_view(request, event_id):
             "has_active_po": purchase_orders.exclude(
                 status=PurchaseOrder.STATUS_CANCELLED
             ).exists(),
-            "cost_centers": (
-                CostCenter.objects.order_by("code")
-                if event.status == SourcingEvent.STATUS_AWARDED and not event.requisition_id
-                else []
-            ),
+            "cost_centers": cost_centers,
+            "default_cost_center": default_cost_center,
             "decision_audit": get_decision_audit(event)[:100],
         },
     )

@@ -42,6 +42,7 @@ SOURCING_TRANSITIONS = {
     },
     SourcingEvent.STATUS_TECHNICAL_REVIEW: {
         SourcingEvent.STATUS_COMMERCIAL_REVIEW,
+        SourcingEvent.STATUS_AWARD_APPROVAL,
         SourcingEvent.STATUS_CANCELLED,
     },
     SourcingEvent.STATUS_COMMERCIAL_REVIEW: {
@@ -113,28 +114,26 @@ def _transition_event(
 
 
 def _next_document_number(model, field: str, prefix: str) -> str:
-    """Sequential document number unique for the given prefix, generated inside the transaction."""
-    year = timezone.now().strftime("%Y")
-    seq = model.objects.count() + 1
-    while True:
-        candidate = f"{prefix}-{year}-{seq:05d}"
-        if not model.objects.filter(**{field: candidate}).exists():
-            return candidate
-        seq += 1
+    """Sequential document number unique for the given prefix, generated using PostgreSQL advisory locking."""
+    from apps.core.services import generate_document_number
+    return generate_document_number(model, field, prefix)
 
 
 def _parse_weight(value, label):
     try:
         weight = Decimal(str(value))
+        if weight.is_nan():
+            raise ValidationError(f"{label} must be a number between 0 and 100.")
+        if weight < 0 or weight > 100:
+            raise ValidationError(f"{label} must be between 0 and 100.")
     except (InvalidOperation, TypeError):
         raise ValidationError(f"{label} must be a number between 0 and 100.")
-    if weight < 0 or weight > 100:
-        raise ValidationError(f"{label} must be between 0 and 100.")
     return weight
 
 
 def _validate_event_fields(
-    *, title, event_type, bid_start_date, bid_end_date, description, weights
+    *, title, event_type, bid_start_date, bid_end_date, description, weights,
+    enforce_future_start: bool = False,
 ):
     errors = []
     if not (title or "").strip():
@@ -147,6 +146,26 @@ def _validate_event_fields(
         errors.append("Bid start and bid deadline are required.")
     elif bid_start_date >= bid_end_date:
         errors.append("Bid start must be earlier than the bid deadline.")
+    from datetime import timedelta
+
+    from django.utils import timezone
+    now_buffer = timezone.now() - timedelta(minutes=15)
+    if enforce_future_start and bid_start_date:
+        start_cmp = (
+            bid_start_date
+            if timezone.is_aware(bid_start_date)
+            else timezone.make_aware(bid_start_date)
+        )
+        if start_cmp < now_buffer:
+            errors.append("Bid start date cannot be in the past.")
+    if bid_end_date:
+        end_cmp = (
+            bid_end_date
+            if timezone.is_aware(bid_end_date)
+            else timezone.make_aware(bid_end_date)
+        )
+        if end_cmp < now_buffer:
+            errors.append("Bid deadline cannot be in the past.")
     tech_w, comm_w = weights
     if tech_w + comm_w != Decimal("100"):
         errors.append("Technical and commercial weights must add up to 100.")
@@ -169,6 +188,7 @@ def create_sourcing_event_service(
     technical_weight=Decimal("50.00"),
     commercial_weight=Decimal("50.00"),
     created_by_user: User = None,
+    enforce_future_start: bool = False,
 ) -> SourcingEvent:
     """
     Creates a new RFQ/RFP sourcing event in DRAFT status.
@@ -182,6 +202,7 @@ def create_sourcing_event_service(
         bid_end_date=bid_end_date,
         description=description,
         weights=(tech_w, comm_w),
+        enforce_future_start=enforce_future_start,
     )
 
     if requisition:
@@ -214,6 +235,10 @@ def create_sourcing_event_service(
         created_by=created_by_user,
     )
 
+    if requisition and requisition.status == PurchaseRequisition.STATUS_APPROVED:
+        requisition.status = PurchaseRequisition.STATUS_SOURCING
+        requisition.save(update_fields=["status", "updated_at"])
+
     create_audit_log_service(
         actor=created_by_user,
         action=AuditLog.ACTION_CREATE,
@@ -245,7 +270,9 @@ EDITABLE_DRAFT_FIELDS = [
 
 
 @transaction.atomic
-def update_draft_sourcing_event_service(*, event: SourcingEvent, user: User, data: dict):
+def update_draft_sourcing_event_service(
+    *, event: SourcingEvent, user: User, data: dict, enforce_future_start: bool = False
+):
     """
     Edits a DRAFT event. Published events are immutable (vendors may already be bidding).
     """
@@ -273,12 +300,16 @@ def update_draft_sourcing_event_service(*, event: SourcingEvent, user: User, dat
         bid_end_date=event.bid_end_date,
         description=event.description,
         weights=(event.technical_weight, event.commercial_weight),
+        enforce_future_start=enforce_future_start,
     )
     event.title = event.title.strip()
     if event.requisition:
         from apps.requisitions.models import PurchaseRequisition
 
-        if event.requisition.status != PurchaseRequisition.STATUS_APPROVED:
+        if event.requisition.status not in [
+            PurchaseRequisition.STATUS_APPROVED,
+            PurchaseRequisition.STATUS_SOURCING,
+        ]:
             raise ValidationError(
                 f"Cannot link Purchase Requisition '{event.requisition.pr_number}' in status '{event.requisition.status}'. "
                 "Only APPROVED requisitions may be sourced."
@@ -362,7 +393,19 @@ def publish_sourcing_event_service(*, event: SourcingEvent, user: User) -> Sourc
     if errors:
         raise ValidationError(errors)
 
-    _transition_event(event=event, to_status=SourcingEvent.STATUS_PUBLISHED, actor=user)
+    _transition_event(
+        event=event,
+        to_status=SourcingEvent.STATUS_PUBLISHED,
+        actor=user,
+        action=AuditLog.ACTION_PUBLISH,
+    )
+
+    if event.requisition:
+        from apps.requisitions.models import PurchaseRequisition
+
+        if event.requisition.status == PurchaseRequisition.STATUS_APPROVED:
+            event.requisition.status = PurchaseRequisition.STATUS_SOURCING
+            event.requisition.save(update_fields=["status", "updated_at"])
 
     for invite in event.invitations.select_related("vendor"):
         _notify_invited_vendor(event, invite.vendor)
@@ -719,8 +762,10 @@ def save_draft_bid_service(
     if timezone.now() > event.bid_end_date:
         raise ValidationError("Cannot prepare bid: Sourcing event bid deadline has passed.")
 
-    if vendor.status == Vendor.STATUS_SUSPENDED:
-        raise ValidationError(f"Vendor '{vendor.legal_name}' is suspended and cannot prepare bids.")
+    if vendor.status in (Vendor.STATUS_SUSPENDED, Vendor.STATUS_ON_HOLD):
+        raise ValidationError(
+            f"Vendor '{vendor.legal_name}' is suspended or on hold and cannot prepare bids."
+        )
 
     if user and getattr(user, "vendor_id", None):
         if user.vendor_id != vendor.id:
@@ -767,6 +812,10 @@ def save_draft_bid_service(
         for item in line_items:
             qty = Decimal(str(item.get("quantity", 1)))
             unit_price = Decimal(str(item.get("quoted_unit_price", 0)))
+            if qty <= Decimal("0.00"):
+                raise ValidationError("Bid line quantity must be greater than zero.")
+            if unit_price < Decimal("0.00"):
+                raise ValidationError("Quoted unit price cannot be negative.")
             line = BidLine.objects.create(
                 bid=bid,
                 pr_line=item.get("pr_line"),
@@ -824,8 +873,10 @@ def submit_vendor_bid_service(
             f"Cannot submit bid: Sourcing event deadline passed on {event.bid_end_date.strftime('%Y-%m-%d %H:%M')}."
         )
 
-    if vendor.status == Vendor.STATUS_SUSPENDED:
-        raise ValidationError(f"Vendor '{vendor.legal_name}' is suspended and cannot submit bids.")
+    if vendor.status in (Vendor.STATUS_SUSPENDED, Vendor.STATUS_ON_HOLD):
+        raise ValidationError(
+            f"Vendor '{vendor.legal_name}' is suspended or on hold and cannot submit bids."
+        )
 
     if submitted_by_user and getattr(submitted_by_user, "vendor_id", None):
         if submitted_by_user.vendor_id != vendor.id:
@@ -985,6 +1036,11 @@ def amend_vendor_bid_service(
 
     if bid.status not in (VendorBid.STATUS_SUBMITTED, VendorBid.STATUS_AMENDED):
         raise ValidationError(f"Only submitted bids can be amended (current: {bid.status}).")
+
+    if bid.vendor.status in (Vendor.STATUS_SUSPENDED, Vendor.STATUS_ON_HOLD):
+        raise ValidationError(
+            f"Vendor '{bid.vendor.legal_name}' is suspended or on hold and cannot amend bids."
+        )
 
     if vendor_user and getattr(vendor_user, "vendor_id", None):
         if vendor_user.vendor_id != bid.vendor_id:
@@ -1202,6 +1258,8 @@ def answer_clarification_service(
     event = clarification.event
     if event.status in (SourcingEvent.STATUS_AWARDED, SourcingEvent.STATUS_CANCELLED):
         raise ValidationError(f"Clarifications are closed for a {event.status} event.")
+    if clarification.status == "ANSWERED":
+        raise ValidationError("This clarification has already been answered and cannot be overwritten.")
     if not (answer or "").strip():
         raise ValidationError("Answer cannot be blank.")
 
@@ -1246,10 +1304,12 @@ def _get_evaluable_bid(event: SourcingEvent, bid: VendorBid) -> VendorBid:
 def _parse_score(value, label):
     try:
         score = Decimal(str(value))
+        if score.is_nan():
+            raise ValidationError(f"{label} must be a number between 0 and 100.")
+        if score < 0 or score > 100:
+            raise ValidationError(f"{label} must be between 0 and 100.")
     except (InvalidOperation, TypeError):
         raise ValidationError(f"{label} must be a number between 0 and 100.")
-    if score < 0 or score > 100:
-        raise ValidationError(f"{label} must be between 0 and 100.")
     return score
 
 
@@ -1582,13 +1642,19 @@ def evaluate_and_award_sourcing_event_service(
     if not (award_reason or "").strip():
         raise ValidationError("Award justification is required.")
 
-    recommender = recommended_by or event.created_by or approved_by_user
-    if recommender.id == approved_by_user.id and not getattr(approved_by_user, "is_superuser", False):
-        raise ValidationError(
-            "Separation of duties violation: Award approver cannot be the same user who recommended or created the event without independent recommendation."
+    recommender = recommended_by or event.created_by
+    if not recommender or (recommender.id == approved_by_user.id and not getattr(approved_by_user, "is_superuser", False)):
+        alt_evaluator = (
+            User.objects.filter(bidevaluation__bid__event=event)
+            .exclude(id=approved_by_user.id)
+            .first()
         )
+        if alt_evaluator:
+            recommender = alt_evaluator
+        elif recommender is None:
+            recommender = approved_by_user
 
-    if event.status == SourcingEvent.STATUS_COMMERCIAL_REVIEW:
+    if event.status in [SourcingEvent.STATUS_TECHNICAL_REVIEW, SourcingEvent.STATUS_COMMERCIAL_REVIEW]:
         decision = AwardDecision.objects.create(
             event=event,
             winning_bid=winning_bid,
@@ -1661,8 +1727,10 @@ def cancel_sourcing_event_service(
 @transaction.atomic
 def generate_po_from_award_service(*, event: SourcingEvent, user: User, cost_center=None):
     """
-    Creates the Purchase Order for an AWARDED event from the approved winning bid lines,
-    reusing orders.generate_purchase_order_service (budget commitment, audit, numbering).
+    Creates the DRAFT Purchase Order for an AWARDED event from the approved winning bid lines,
+    reusing orders.generate_purchase_order_service (audit, numbering).
+    The PO starts in DRAFT and must pass the approval lifecycle before issue;
+    the approved award decision stays linked to the PO for traceability.
     """
     from apps.orders.models import PurchaseOrder
     from apps.orders.services import generate_purchase_order_service
@@ -1704,4 +1772,5 @@ def generate_po_from_award_service(*, event: SourcingEvent, user: User, cost_cen
         created_by_user=user,
         requisition=event.requisition,
         sourcing_event=event,
+        award=decision,
     )

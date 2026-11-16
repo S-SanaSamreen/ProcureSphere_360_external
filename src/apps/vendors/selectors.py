@@ -1,6 +1,5 @@
 from datetime import timedelta
 
-from django.db.models import Q
 from django.utils import timezone
 
 from .models import Vendor, VendorDocument
@@ -9,8 +8,6 @@ from .models import Vendor, VendorDocument
 def scope_vendors_queryset(qs, user=None):
     if not user:
         return qs
-    if user.is_superuser:
-        return qs
     role_code = getattr(user, "role_code", None)
     from apps.accounts.models import Role
     if role_code == Role.VENDOR_USER:
@@ -18,14 +15,9 @@ def scope_vendors_queryset(qs, user=None):
         return qs
     scoped_org = getattr(user, "effective_organization", None)
     if scoped_org:
-        # Vendors explicitly assigned to this org, OR vendors with no org (global/legacy)
-        return qs.filter(
-            Q(organization=scoped_org)
-            | Q(organization__isnull=True)
-            | Q(created_by__organization=scoped_org)
-            | Q(created_by__department__organization=scoped_org)
-            | Q(organization__isnull=True)
-        )
+        # Strict multi-tenant isolation: organizations never share vendor data.
+        # Only vendors explicitly created for this organization are returned.
+        return qs.filter(organization=scoped_org)
     if user.is_superuser or getattr(user, "is_staff", False):
         return qs
     from apps.accounts.models import Role
@@ -39,6 +31,7 @@ def scope_vendors_queryset(qs, user=None):
         Role.AUDITOR,
         Role.SUPER_ADMIN,
         Role.FINANCE_AP,
+        Role.LEGAL_MGR,
     ]:
         return qs
     return qs.none()
@@ -492,12 +485,20 @@ def get_vendor_kyc_summary(vendor) -> dict:
     verified = [d for d in docs if d.review_status == VendorDocument.REVIEW_VERIFIED]
     rejected = [d for d in docs if d.review_status == VendorDocument.REVIEW_REJECTED]
     pending = [d for d in docs if d.review_status == VendorDocument.REVIEW_PENDING]
+    from .kyc_policy import ProvisionalKYCPolicy as KYCPolicy
     mandatory = list(getattr(settings, "VENDOR_MANDATORY_KYC_DOC_TYPES", []) or [])
+    if not mandatory:
+        mandatory = KYCPolicy.get_mandatory_doc_types(vendor)
+    present_types = {d.document_type for d in docs}
     present_verified_types = {d.document_type for d in verified}
-    missing_mandatory = [t for t in mandatory if t not in {d.document_type for d in docs}]
-    unverified_mandatory = [
-        t for t in mandatory if t in {d.document_type for d in docs} - present_verified_types
-    ]
+    missing_mandatory = []
+    unverified_mandatory = []
+    for req_type in mandatory:
+        allowed_group = KYCPolicy.EQUIVALENCE_GROUPS.get(req_type, {req_type})
+        if not (allowed_group & present_types):
+            missing_mandatory.append(req_type)
+        elif not (allowed_group & present_verified_types):
+            unverified_mandatory.append(req_type)
     labels = dict(VendorDocument.DOC_TYPE_CHOICES)
 
     status = vendor.status

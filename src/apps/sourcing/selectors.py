@@ -30,12 +30,10 @@ def get_all_sourcing_events():
     )
 
 
-def get_sourcing_events_for_user(user):
-    """
-    Object-level scoping: internal readers see all events; vendor users see only events they
-    are invited to and that have been published (drafts are never exposed to vendors).
-    """
-    qs = get_all_sourcing_events()
+def _scope_sourcing_queryset(qs, user):
+    """Apply consistent role and organization scoping for sourcing events and KPI metrics."""
+    if user is None or not getattr(user, "is_authenticated", False):
+        return qs.none()
     if user.is_vendor:
         if not user.vendor_id:
             return qs.none()
@@ -44,15 +42,25 @@ def get_sourcing_events_for_user(user):
         )
     if can_view_events(user):
         if not user.is_superuser:
-            user_dept = getattr(user, "department", None)
-            user_org = getattr(user_dept, "organization", None) if user_dept else None
+            user_org = getattr(user, "effective_organization", None)
             if user_org:
                 qs = qs.filter(
                     Q(requisition__department__organization=user_org)
+                    | Q(requisition__isnull=True, created_by__organization=user_org)
                     | Q(requisition__isnull=True, created_by__department__organization=user_org)
+                    | Q(requisition__isnull=True, created_by__isnull=True)
                 )
         return qs
     return qs.none()
+
+
+def get_sourcing_events_for_user(user):
+    """
+    Object-level scoping: internal readers see all events in their organization;
+    vendor users see only events they are invited to and that have been published
+    (drafts are never exposed to vendors).
+    """
+    return _scope_sourcing_queryset(get_all_sourcing_events(), user)
 
 
 def get_sourcing_event_by_id(event_id):
@@ -101,10 +109,18 @@ def search_sourcing_events(queryset, params):
     return queryset
 
 
-def get_sourcing_dashboard_metrics() -> dict:
-    """RFQ/RFP KPIs for the Procurement Executive dashboard (one aggregate query)."""
+def get_sourcing_dashboard_metrics(user=None) -> dict:
+    """RFQ/RFP KPIs for the Procurement Executive dashboard (one aggregate query).
+
+    Uses the exact same role and organization scoping as ``get_sourcing_events_for_user``
+    so KPI summary cards always match the sourcing register table."""
     now = timezone.now()
-    return SourcingEvent.objects.aggregate(
+    qs = (
+        _scope_sourcing_queryset(SourcingEvent.objects.all(), user)
+        if user is not None
+        else SourcingEvent.objects.all()
+    )
+    return qs.aggregate(
         total=Count("id"),
         draft=Count("id", filter=Q(status=SourcingEvent.STATUS_DRAFT)),
         published=Count("id", filter=Q(status=SourcingEvent.STATUS_PUBLISHED)),
@@ -153,7 +169,9 @@ def get_sealed_vendor_bids(event: SourcingEvent, requesting_user):
     if not can_read_bids(requesting_user) or not event.bids_visible_to_evaluators:
         return VendorBid.objects.none()
 
-    return queryset.exclude(status=VendorBid.STATUS_DRAFT).order_by("total_bid_amount")
+    return queryset.filter(
+        status__in=[VendorBid.STATUS_SUBMITTED, VendorBid.STATUS_AMENDED]
+    ).order_by("total_bid_amount")
 
 
 def get_bid_attachments_for_evaluator(event: SourcingEvent, user):
@@ -230,7 +248,18 @@ def get_invitation_rows(event: SourcingEvent):
     return rows
 
 
-def get_eligible_vendors_for_event(event: SourcingEvent, category_id=None, q=""):
+def _scope_vendor_queryset_to_org(qs, organization):
+    if organization is None:
+        return qs
+    return qs.filter(
+        Q(organization=organization)
+        | Q(organization__isnull=True)
+        | Q(created_by__organization=organization)
+        | Q(created_by__department__organization=organization)
+    )
+
+
+def get_eligible_vendors_for_event(event: SourcingEvent, category_id=None, q="", organization=None):
     from apps.vendors.models import Vendor
 
     from .services import ELIGIBLE_VENDOR_STATUSES
@@ -242,6 +271,7 @@ def get_eligible_vendors_for_event(event: SourcingEvent, category_id=None, q="")
         .select_related("category")
         .order_by("legal_name")
     )
+    qs = _scope_vendor_queryset_to_org(qs, organization)
     if category_id:
         qs = qs.filter(category_id=category_id)
     if q:
@@ -254,7 +284,7 @@ def get_eligible_vendors_for_event(event: SourcingEvent, category_id=None, q="")
 PENDING_ONBOARDING_STATUSES = ["DRAFT", "SUBMITTED", "KYC_REVIEW"]
 
 
-def get_pending_onboarding_vendors(event: SourcingEvent, category_id=None, q=""):
+def get_pending_onboarding_vendors(event: SourcingEvent, category_id=None, q="", organization=None):
     """Newly registered vendors that cannot be invited yet (KYC not approved). Display only."""
     from apps.vendors.models import Vendor
 
@@ -265,6 +295,7 @@ def get_pending_onboarding_vendors(event: SourcingEvent, category_id=None, q="")
         .select_related("category")
         .order_by("legal_name")
     )
+    qs = _scope_vendor_queryset_to_org(qs, organization)
     if category_id:
         qs = qs.filter(category_id=category_id)
     if q:

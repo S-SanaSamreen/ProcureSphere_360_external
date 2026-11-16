@@ -1,3 +1,5 @@
+import re
+
 from django.conf import settings
 from django.db import models
 
@@ -6,6 +8,7 @@ from apps.core.validators import (
     normalize_tax_identifier,
     validate_file_upload,
     validate_gstin,
+    validate_no_html_or_script,
     validate_pan_gstin_consistency,
     validate_pan_number,
 )
@@ -115,6 +118,11 @@ class Vendor(TimeStampedModel):
 
     def clean(self):
         super().clean()
+        validate_no_html_or_script(self.legal_name, "Legal name")
+        validate_no_html_or_script(self.trade_name, "Trade name")
+        validate_no_html_or_script(self.registration_number, "Registration number")
+        validate_no_html_or_script(self.address, "Address")
+        validate_no_html_or_script(self.bank_name, "Bank name")
         if self.pan_number:
             self.pan_number = normalize_tax_identifier(self.pan_number)
             validate_pan_number(self.pan_number)
@@ -131,6 +139,14 @@ class Vendor(TimeStampedModel):
             self.gstin = normalize_tax_identifier(self.gstin)
         super().save(*args, **kwargs)
 
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["status"], name="vendor_st_idx"),
+            models.Index(fields=["status", "-updated_at"], name="vendor_st_upd_idx"),
+            models.Index(fields=["category", "status"], name="vendor_cat_st_idx"),
+        ]
+
     def __str__(self):
         return f"{self.legal_name} ({self.vendor_number}) [{self.status}]"
 
@@ -146,6 +162,13 @@ class VendorContact(TimeStampedModel):
 
     def __str__(self):
         return f"{self.first_name} {self.last_name} - {self.vendor.legal_name}"
+
+    @property
+    def phone_digits(self) -> str:
+        if not self.phone:
+            return ""
+        digits = re.sub(r"\D", "", self.phone)
+        return digits[-10:] if len(digits) >= 10 else digits
 
 
 class VendorDocument(TimeStampedModel):
@@ -304,11 +327,13 @@ class VendorRiskRecord(TimeStampedModel):
     RISK_LEVEL_LOW = "LOW"
     RISK_LEVEL_MEDIUM = "MEDIUM"
     RISK_LEVEL_HIGH = "HIGH"
+    RISK_LEVEL_CRITICAL = "CRITICAL"
 
     RISK_CHOICES = [
         (RISK_LEVEL_LOW, "Low Risk"),
         (RISK_LEVEL_MEDIUM, "Medium Risk"),
         (RISK_LEVEL_HIGH, "High Risk"),
+        (RISK_LEVEL_CRITICAL, "Critical Risk"),
     ]
 
     vendor = models.ForeignKey(Vendor, on_delete=models.CASCADE, related_name="risk_records")
@@ -344,6 +369,10 @@ class VendorRiskRecord(TimeStampedModel):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["vendor", "-created_at"], name="vendor_risk_v_ts_idx"),
+            models.Index(fields=["risk_level"], name="vendor_risk_lvl_idx"),
+        ]
 
     def __str__(self):
         return f"{self.vendor.legal_name} - {self.risk_level} Risk"
@@ -360,6 +389,8 @@ class VendorCredentialDispatch(TimeStampedModel):
     STATUS_PENDING = "PENDING"
     STATUS_SENT = "SENT"
     STATUS_FAILED = "FAILED"
+    STATUS_DELIVERED = "DELIVERED"
+    STATUS_RETRYING = "RETRYING"
     STATUS_CHOICES = [
         (STATUS_PENDING, "Pending"),
         (STATUS_SENT, "Sent"),
@@ -410,3 +441,33 @@ class VendorCredentialDispatch(TimeStampedModel):
 
     def __str__(self):
         return f"{self.vendor_id} -> {self.sent_to} [{self.status}]"
+
+    def get_status_display(self):
+        display_map = {
+            self.STATUS_PENDING: "Pending",
+            self.STATUS_SENT: "Sent (Awaiting Provider Delivery)",
+            self.STATUS_DELIVERED: "Delivered",
+            self.STATUS_FAILED: "Failed",
+            self.STATUS_RETRYING: "Retrying",
+        }
+        return display_map.get(self.status, self.status)
+
+    @property
+    def is_delivered(self) -> bool:
+        return self.status == self.STATUS_DELIVERED
+
+    @property
+    def is_failed(self) -> bool:
+        return self.status == self.STATUS_FAILED
+
+    @property
+    def is_retrying(self) -> bool:
+        return self.status == self.STATUS_RETRYING
+
+    @property
+    def is_sent(self) -> bool:
+        return self.status == self.STATUS_SENT
+
+    @property
+    def can_retry(self) -> bool:
+        return self.status in (self.STATUS_FAILED, self.STATUS_PENDING)

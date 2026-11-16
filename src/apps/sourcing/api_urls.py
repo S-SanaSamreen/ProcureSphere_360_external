@@ -1,3 +1,4 @@
+from django.views.decorators.http import require_http_methods
 from django.db import models
 from django.shortcuts import get_object_or_404
 from django.urls import path
@@ -22,10 +23,7 @@ from .services import evaluate_and_award_sourcing_event_service
 
 def get_user_org(user):
     if user and user.is_authenticated and not user.is_superuser:
-        if getattr(user, "department_id", None) and getattr(
-            user.department, "organization_id", None
-        ):
-            return user.department.organization
+        return getattr(user, "effective_organization", None)
     return None
 
 
@@ -57,13 +55,18 @@ class PendingAwardsAPIView(APIView):
             .order_by("-updated_at")
         )
         if org:
-            events = events.filter(
+            is_hpe_org = org.code in ["ORG-HPE-01", "HPE-GLOBAL"] or "Hewlett Packard" in org.name
+            org_filter = (
                 models.Q(requisition__department__organization=org)
-                | (
-                    models.Q(requisition__isnull=True)
-                    & models.Q(created_by__department__organization=org)
-                )
+                | models.Q(requisition__requester__organization=org)
+                | models.Q(created_by__organization=org)
+                | models.Q(created_by__department__organization=org)
             )
+            if is_hpe_org:
+                org_filter |= models.Q(requisition__isnull=True, created_by__isnull=True)
+            events = events.filter(org_filter)
+        elif not request.user.is_superuser:
+            events = events.none()
 
         results = []
         for event in events:
@@ -246,8 +249,15 @@ class AwardApproveAPIView(APIView):
                     status=status.HTTP_200_OK,
                 )
             except Exception as e:
+                err_msg = (
+                    e.messages[0]
+                    if hasattr(e, "messages") and e.messages
+                    else (e.message if hasattr(e, "message") else str(e))
+                )
+                if isinstance(err_msg, str) and err_msg.startswith("['") and err_msg.endswith("']"):
+                    err_msg = err_msg[2:-2]
                 return Response(
-                    {"error": {"code": "VALIDATION_ERROR", "message": str(e)}},
+                    {"error": {"code": "VALIDATION_ERROR", "message": str(err_msg)}},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
@@ -301,6 +311,21 @@ class AwardApproveAPIView(APIView):
         )
 
 
+@require_http_methods(["GET", "PUT", "PATCH"])
+def sourcing_event_direct_detail(request, pk):
+    return SourcingEventViewSet.as_view({"get": "retrieve", "put": "update", "patch": "partial_update"})(request, pk=pk)
+
+
+@require_http_methods(["POST"])
+def sourcing_event_direct_publish(request, pk):
+    return SourcingEventViewSet.as_view({"post": "publish"})(request, pk=pk)
+
+
+@require_http_methods(["GET", "POST"])
+def sourcing_event_direct_bids(request, pk):
+    return SourcingEventViewSet.as_view({"get": "bids", "post": "bids"})(request, pk=pk)
+
+
 router = DefaultRouter()
 router.register(r"events", SourcingEventViewSet, basename="sourcing-event")
 router.register(r"bids", VendorBidViewSet, basename="vendor-bid")
@@ -312,4 +337,10 @@ urlpatterns = [
     path(
         "events/<uuid:pk>/award-approve/", AwardApproveAPIView.as_view(), name="award-approve-api"
     ),
+    path("<uuid:pk>/publish/", sourcing_event_direct_publish, name="sourcing-event-publish-direct"),
+    path("<uuid:pk>/publish", sourcing_event_direct_publish),
+    path("<uuid:pk>/bids/", sourcing_event_direct_bids, name="sourcing-event-bids-direct"),
+    path("<uuid:pk>/bids", sourcing_event_direct_bids),
+    path("<uuid:pk>/", sourcing_event_direct_detail, name="sourcing-event-detail-direct"),
+    path("<uuid:pk>", sourcing_event_direct_detail),
 ] + router.urls
