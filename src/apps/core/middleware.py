@@ -9,12 +9,35 @@ def get_current_request_id():
     return getattr(_request_context, "request_id", None)
 
 
+def set_current_request_id(request_id):
+    _request_context.request_id = request_id
+
+
 def get_current_user():
     return getattr(_request_context, "user", None)
 
 
+def set_current_user(user):
+    _request_context.user = user
+
+
 def get_client_ip():
     return getattr(_request_context, "client_ip", None)
+
+
+def get_current_user_agent():
+    return getattr(_request_context, "user_agent", "")
+
+
+def set_client_ip(ip):
+    _request_context.client_ip = ip
+
+
+def clear_request_context():
+    """Clears all thread-local request and correlation context."""
+    _request_context.request_id = None
+    _request_context.client_ip = None
+    _request_context.user = None
 
 
 class RequestIDMiddleware:
@@ -26,17 +49,19 @@ class RequestIDMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+        raw_request_id = request.headers.get("X-Request-ID")
+        request_id = raw_request_id.strip() if raw_request_id and raw_request_id.strip() else str(uuid.uuid4())
         request.request_id = request_id
         _request_context.request_id = request_id
 
         # Determine client IP address
         x_forwarded_for = request.META.get("HTTP_X_FORWARDED_FOR")
-        if x_forwarded_for:
+        if x_forwarded_for and x_forwarded_for.strip():
             ip = x_forwarded_for.split(",")[0].strip()
         else:
             ip = request.META.get("REMOTE_ADDR")
         _request_context.client_ip = ip
+        _request_context.user_agent = request.META.get("HTTP_USER_AGENT", "")
 
         try:
             response = self.get_response(request)
@@ -44,8 +69,29 @@ class RequestIDMiddleware:
             # Never leak request context into later work on the same thread.
             _request_context.request_id = None
             _request_context.client_ip = None
+            _request_context.user_agent = None
         response["X-Request-ID"] = request_id
+        response["Server"] = "ProcureSphere360"
         return response
+
+
+class ApiSlashMiddleware:
+    """
+    Appends trailing slash internally to /api/ requests so POST/PUT/PATCH/DELETE
+    do not trigger Django's CommonMiddleware APPEND_SLASH RuntimeError 500.
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        if (
+            request.path_info.startswith("/api/")
+            and not request.path_info.endswith("/")
+            and not request.path_info.endswith((".json", ".yaml", ".yml", ".pdf", ".xlsx", ".csv"))
+        ):
+            request.path_info = request.path_info + "/"
+        return self.get_response(request)
 
 
 class AuditContextMiddleware:
@@ -93,6 +139,19 @@ class SecurityHeadersMiddleware:
             response["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         if "Permissions-Policy" not in response:
             response["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+
+        # Enforce secure cookies on HTTPS/TLS reverse proxies (DEF-007)
+        if request.is_secure() or request.headers.get("X-Forwarded-Proto") == "https":
+            if "sessionid" in response.cookies:
+                response.cookies["sessionid"]["secure"] = True
+
+        # Prevent DEBUG mode information leakage on 404 responses (DEF-006)
+        if response.status_code == 404 and not request.path.startswith("/api/"):
+            content = getattr(response, "content", b"")
+            if b"Page not found at" in content or b"DEBUG = True" in content or b"URLconf" in content:
+                from apps.core.views import custom_404_view
+                return custom_404_view(request)
+
         return response
 
 
@@ -119,8 +178,6 @@ class VendorPortalIsolationMiddleware:
         "/api/v1/requisitions",
         "/api/v1/contracts",
         "/api/v1/budgets",
-        "/api/v1/receipts",
-        "/api/v1/invoices",
         "/api/v1/reports",
         "/api/v1/audit",
         "/api/v1/manager",
@@ -160,4 +217,39 @@ class VendorPortalIsolationMiddleware:
                         raise PermissionDenied("Vendors are restricted to the Vendor Portal (/vendor/).")
 
         return self.get_response(request)
+
+
+class HtmxAuthInterceptorMiddleware:
+    """
+    Prevents HTMX requests from swapping full HTML login pages into partial or modal containers.
+    If an HTMX request receives a redirect to login or an unauthenticated response,
+    this converts it into a 200 response with the 'HX-Redirect' header so HTMX
+    navigates the entire browser window cleanly.
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        response = self.get_response(request)
+        is_htmx = (
+            request.headers.get("HX-Request") == "true"
+            or request.META.get("HTTP_HX_REQUEST") == "true"
+        )
+        if is_htmx:
+            location = response.get("Location", "")
+            if response.status_code in (301, 302, 303, 307) and (
+                "/login" in location or "accounts/login" in location
+            ):
+                from django.http import HttpResponse
+
+                clean_loc = location if location else "/login/?session_expired=1"
+                htmx_resp = HttpResponse(status=200)
+                htmx_resp["HX-Redirect"] = clean_loc
+                return htmx_resp
+
+            if response.status_code in (401, 403):
+                response["HX-Redirect"] = "/login/?session_expired=1"
+
+        return response
 

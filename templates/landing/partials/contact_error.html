@@ -10,12 +10,13 @@
   hx-post="/htmx/contact/"
   hx-target="#contact-form-wrapper"
   hx-swap="innerHTML"
+  hx-on::before-request="try{sessionStorage.setItem('ps_active_tab','true');}catch(e){}"
   hx-on::after-request="onContactFormResponse(event)"
 >
   <input type="hidden" name="csrfmiddlewaretoken" value="">
   <div class="form-grid" style="grid-template-columns: repeat(2, 1fr);">
     <label>
-      <span>Name</span>
+      <span>Name <span style="color: #dc2626; font-weight: bold;" aria-hidden="true">*</span></span>
       <input
         required
         type="text"
@@ -30,7 +31,7 @@
       />
     </label>
     <label>
-      <span>Mobile Number</span>
+      <span>Mobile Number <span style="color: #dc2626; font-weight: bold;" aria-hidden="true">*</span></span>
       <div class="phone-input-group" style="display:flex;gap:8px;align-items:stretch;">
         <select
           name="country_code"
@@ -65,7 +66,7 @@
     </label>
   </div>
   <label>
-    <span>Email</span>
+    <span>Email <span style="color: #dc2626; font-weight: bold;" aria-hidden="true">*</span></span>
     <input
       required
       type="email"
@@ -78,7 +79,7 @@
     />
   </label>
   <label>
-    <span>Message</span>
+    <span>Message <span style="color: #dc2626; font-weight: bold;" aria-hidden="true">*</span></span>
     <textarea
       required
       name="message"

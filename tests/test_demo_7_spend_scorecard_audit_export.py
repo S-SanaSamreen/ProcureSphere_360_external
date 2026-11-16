@@ -16,6 +16,7 @@ from apps.reports.services import (
     get_spend_analytics_report,
     get_supplier_performance_report,
 )
+from apps.requisitions.models import PurchaseRequisition
 from apps.requisitions.services import create_purchase_requisition_service
 from apps.scorecards.services import calculate_vendor_scorecard_service
 from apps.vendors.models import Vendor, VendorCategory
@@ -69,6 +70,10 @@ def test_demo_7_spend_scorecard_and_audited_report_export():
     )
     vendor.status = Vendor.STATUS_ACTIVE
     vendor.save(update_fields=["status", "updated_at"])
+    vendor_role, _ = Role.objects.get_or_create(code=Role.VENDOR_USER, defaults={"name": "Vendor User"})
+    vendor_user = User.objects.create_user(
+        email="vendor.d7@omnicloud.com", password="password123", role=vendor_role, vendor=vendor
+    )
 
     pr = create_purchase_requisition_service(
         title="High Performance Switches",
@@ -86,6 +91,8 @@ def test_demo_7_spend_scorecard_and_audited_report_export():
         ],
     )
     check_and_reserve_budget_service(requisition=pr, requested_by_user=proc_mgr)
+    pr.status = PurchaseRequisition.STATUS_APPROVED
+    pr.save(update_fields=["status"])
 
     po = generate_purchase_order_service(
         vendor=vendor,
@@ -98,13 +105,18 @@ def test_demo_7_spend_scorecard_and_audited_report_export():
     )
     po.status = PurchaseOrder.STATUS_ISSUED
     po.save(update_fields=["status"])
-    acknowledge_purchase_order_service(po=po, vendor_user=proc_mgr)
+    acknowledge_purchase_order_service(po=po, vendor_user=vendor_user)
 
     create_goods_receipt_service(
         po=po,
         received_by=stores_user,
         receipt_items=[
-            {"po_line": po.lines.first(), "quantity_received": 5, "quantity_accepted": 4}
+            {
+                "po_line": po.lines.first(),
+                "quantity_received": 5,
+                "quantity_accepted": 4,
+                "rejection_reason": "1 unit damaged in transit",
+            }
         ],
     )
 
@@ -131,7 +143,7 @@ def test_demo_7_spend_scorecard_and_audited_report_export():
         due_date=timezone.now().date() + timezone.timedelta(days=30),
         subtotal=Decimal("10000.00"),
         total_amount=Decimal("10000.00"),
-        status=SupplierInvoice.STATUS_RECEIVED,
+        status=SupplierInvoice.STATUS_PAID,
     )
 
     spend_report = get_spend_analytics_report()

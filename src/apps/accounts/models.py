@@ -23,6 +23,7 @@ class Role(models.Model):
     PROC_EXEC = "PROC_EXEC"
 
     PROC_MGR = "PROC_MGR"
+    PROCUREMENT_MANAGER = "PROC_MGR"
 
     FINANCE_AP = "FINANCE_AP"
 
@@ -280,10 +281,13 @@ class User(AbstractUser):
             self.is_superuser = False
             self.is_staff = False
 
-        # Only Requesters are tied to a Department and Cost Center.
-        # All other roles belong to the entire organization and have no department/cost center.
+        # Requesters have Department & Cost Center. Department Approvers can be assigned a Department.
+        # Cost centers are restricted to Requesters; non-department roles have department cleared.
         if self.role and self.role.code != Role.REQUESTER:
-            self.department = None
+            if not self.organization_id and self.department_id and hasattr(self.department, "organization"):
+                self.organization = self.department.organization
+            if self.role.code != Role.DEPT_APPROVER:
+                self.department = None
             self.cost_center = None
 
         super().save(*args, **kwargs)

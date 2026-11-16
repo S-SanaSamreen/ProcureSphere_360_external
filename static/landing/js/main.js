@@ -222,9 +222,12 @@
     // Overlay login button
     const overlayLoginBtn = document.getElementById('overlay-login-btn');
     if (overlayLoginBtn) {
-      overlayLoginBtn.addEventListener('click', () => {
+      overlayLoginBtn.addEventListener('click', (e) => {
         closeMenu();
-        window.location.href = '/login/';
+        const targetUrl = overlayLoginBtn.getAttribute('href') || '/login/';
+        if (targetUrl && targetUrl !== '#' && !targetUrl.startsWith('javascript:')) {
+          window.location.href = targetUrl;
+        }
       });
     }
   })();
@@ -262,6 +265,10 @@
     // Direct navigation to dedicated /login/ page
     document.querySelectorAll('#login-btn, #overlay-login-btn').forEach(btn => {
       btn.addEventListener('click', (e) => {
+        const href = btn.getAttribute('href');
+        if (href && href !== '#' && !href.startsWith('javascript:')) {
+          return;
+        }
         e.preventDefault();
         window.location.href = '/login/';
       });
@@ -370,8 +377,14 @@
 
         if (data && data.ok) {
           // setLoginCharState('success');
-          // Navigate to role-based dashboard returned by ERP backend
-          window.location.href = data.redirect || '/';
+          try {
+            sessionStorage.removeItem('ps_nav_stack');
+            sessionStorage.removeItem('ps_nav_index');
+            sessionStorage.setItem('ps_just_logged_in', 'true');
+            sessionStorage.setItem('ps_active_tab', 'true');
+          } catch (_) {}
+          // Replace history state so the unauthenticated landing page is not in history
+          window.location.replace(data.redirect || '/');
         } else {
           // Invalid credentials — stay in modal, show error
           // setLoginCharState('failed');
@@ -574,7 +587,7 @@
       // Update active label
       const label = document.getElementById('active-module-label');
       if (label && card) {
-        label.textContent = card.dataset.name + ' selected →';
+        label.innerHTML = `${card.dataset.name} selected <span class="desktop-arrow">→</span><span class="mobile-arrow">↓</span>`;
         label.style.color = card.dataset.color;
       }
     };
@@ -968,90 +981,6 @@
     );
     document.querySelectorAll('.animate-on-scroll:not(.in-view)').forEach(el => observer.observe(el));
   });
-
-  /* ─────────────────────────────────────────────
-     19. MODAL QUICK-LOGIN (dev-only convenience)
-     Mirrors quickLogin() in /login/ ERP page.
-     Fills confirmed dev credentials and triggers
-     the modal's AJAX submit handler.
-  ──────────────────────────────────────────────*/
-  window.modalQuickLogin = function (email) {
-    const emailInput = document.getElementById('login-userid');
-    const pwInput    = document.getElementById('login-password');
-    if (emailInput) emailInput.value = email;
-    if (pwInput)    pwInput.value    = 'Password123!';
-    // Trigger the modal's AJAX form submit
-    const form = document.getElementById('login-form');
-    if (form) form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-  };
-
-  /* ─────────────────────────────────────────────
-     DEV QUICK-LOGIN STYLES (match modal palette)
-  ──────────────────────────────────────────────*/
-  (function devLoginStyles() {
-    const s = document.createElement('style');
-    s.textContent = `
-      .dev-quick-login-section {
-        margin-top: 18px;
-        padding: 14px 16px;
-        background: #fffbeb;
-        border: 1.5px solid #fde68a;
-        border-radius: 10px;
-      }
-      .dev-quick-login-label {
-        font-size: 12px;
-        font-weight: 600;
-        color: #92400e;
-        margin: 0 0 10px;
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        flex-wrap: wrap;
-      }
-      .dev-quick-login-label code {
-        background: #fef3c7;
-        padding: 2px 6px;
-        border-radius: 4px;
-        font-size: 12px;
-        color: #b45309;
-        border: 1px solid #fde68a;
-      }
-      .dev-quick-login-buttons {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 6px;
-      }
-      .dev-ql-btn {
-        padding: 5px 10px;
-        font-size: 11.5px;
-        font-weight: 600;
-        border: 1.5px solid #d1d5db;
-        border-radius: 6px;
-        background: #fff;
-        color: #374151;
-        cursor: pointer;
-        transition: background 0.15s, border-color 0.15s, color 0.15s;
-        font-family: inherit;
-      }
-      .dev-ql-btn:hover {
-        background: #f0f4ff;
-        border-color: #1d68f6;
-        color: #1d68f6;
-      }
-      .dev-ql-btn--vendor {
-        border-color: #06b6d4;
-        color: #0e7490;
-      }
-      .dev-ql-btn--vendor:hover {
-        background: #ecfeff;
-        border-color: #06b6d4;
-        color: #0e7490;
-      }
-      /* Keep modal scrollable when quick-login section is shown */
-      .login-form-section { overflow-y: auto; }
-    `;
-    document.head.appendChild(s);
-  })();
 
 })();
 

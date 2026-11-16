@@ -52,14 +52,16 @@ class Command(BaseCommand):
         user.save()
         return user
 
-    def _activate_vendor(self, vendor, kyc_doc, proc_exec, legal_user, proc_mgr):
-        """Submit KYC, verify doc, and approve vendor if not already active."""
+    def _activate_vendor(self, vendor, kyc_docs, proc_exec, legal_user, proc_mgr):
+        """Submit KYC, verify doc(s), and approve vendor if not already active."""
         if vendor.status == Vendor.STATUS_ACTIVE:
             return
         if vendor.status in (Vendor.STATUS_DRAFT, Vendor.STATUS_CHANGES_REQUIRED):
             submit_vendor_kyc_service(vendor=vendor, user=proc_exec)
-        if not kyc_doc.is_verified:
-            verify_vendor_document_service(document=kyc_doc, verifier=legal_user)
+        docs = kyc_docs if isinstance(kyc_docs, (list, tuple)) else [kyc_docs]
+        for doc in docs:
+            if not doc.is_verified:
+                verify_vendor_document_service(document=doc, verifier=legal_user)
         if vendor.status not in (Vendor.STATUS_ACTIVE,):
             approve_vendor_service(vendor=vendor, manager=proc_mgr, notes="Verified & Approved")
 
@@ -174,7 +176,7 @@ class Command(BaseCommand):
         ApprovalStep.objects.get_or_create(
             policy=pr_policy,
             step_number=2,
-            defaults={"approver_role": roles[Role.FINANCE_AP], "description": "Finance / AP Budget Review"},
+            defaults={"approver_role": roles[Role.PROC_MGR], "description": "Procurement Manager Approval"},
         )
 
         po_amend_policy, _ = ApprovalPolicy.objects.get_or_create(
@@ -221,19 +223,21 @@ class Command(BaseCommand):
         vendor2 = _get_or_create_vendor("TAX-INTEL-882", "Intel Corporation", cat_hw, "sales@intel.com", "2200 Mission College Blvd, Santa Clara, CA")
         vendor3 = _get_or_create_vendor("TAX-MSFT-773", "Microsoft Corporation", cat_sw, "enterprise@microsoft.com", "One Microsoft Way, Redmond, WA")
 
-        def _ensure_kyc_doc(vendor, doc_type=VendorDocument.DOC_TYPE_CERT):
+        def _ensure_kyc_doc(vendor, doc_type=VendorDocument.DOC_TYPE_CERT, title="Certificate of Incorporation"):
             doc = VendorDocument.objects.filter(vendor=vendor, document_type=doc_type).first()
             if not doc:
                 doc = VendorDocument.objects.create(
                     vendor=vendor, document_type=doc_type,
-                    title="Certificate of Incorporation",
+                    title=title,
                     file=SimpleUploadedFile("cert.pdf", b"%PDF-1.4 Content", content_type="application/pdf"),
                 )
             return doc
 
         for v in [vendor1, vendor2, vendor3]:
-            doc = _ensure_kyc_doc(v)
-            self._activate_vendor(v, doc, proc_exec, legal_user, proc_mgr)
+            doc_cert = _ensure_kyc_doc(v, VendorDocument.DOC_TYPE_CERT, "Certificate of Incorporation")
+            doc_tax = _ensure_kyc_doc(v, VendorDocument.DOC_TYPE_TAX, "Tax Clearance Certificate")
+            doc_bank = _ensure_kyc_doc(v, VendorDocument.DOC_TYPE_BANK, "Bank Verification Document")
+            self._activate_vendor(v, [doc_cert, doc_tax, doc_bank], proc_exec, legal_user, proc_mgr)
             v.refresh_from_db()
 
         vendor_user.vendor = vendor1
@@ -258,7 +262,7 @@ class Command(BaseCommand):
                 department=None,
             )
             add_approval_step_service(policy=policy, step_number=1, approver_role=roles[Role.DEPT_APPROVER], description="Department Manager Approval")
-            add_approval_step_service(policy=policy, step_number=2, approver_role=roles[Role.FINANCE_AP], description="Finance / AP Approval")
+            add_approval_step_service(policy=policy, step_number=2, approver_role=roles[Role.PROC_MGR], description="Procurement Manager Approval")
 
         if not ApprovalPolicy.objects.filter(module=ApprovalPolicy.MODULE_PO_AMENDMENT, is_active=True).exists():
             po_amend_policy = create_approval_policy_service(

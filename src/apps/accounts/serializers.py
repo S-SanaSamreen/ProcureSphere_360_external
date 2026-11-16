@@ -36,6 +36,12 @@ class UserSerializer(serializers.ModelSerializer):
 
 class UserCreateSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, min_length=10)
+    role = serializers.PrimaryKeyRelatedField(
+        queryset=Role.objects.all(),
+        required=True,
+        allow_null=False,
+        error_messages={"required": "Role is required. Every user must hold an assigned RBAC role."},
+    )
 
     class Meta:
         model = User
@@ -50,6 +56,36 @@ class UserCreateSerializer(serializers.ModelSerializer):
             "department",
             "vendor",
         ]
+
+    def validate_email(self, value):
+        val = value.strip().lower()
+        if User.objects.filter(email__iexact=val).exists():
+            raise serializers.ValidationError("A user with this email address already exists (case-insensitive).")
+        return val
+
+    def validate_phone_number(self, value):
+        if not value:
+            return ""
+        val = value.strip()
+        import re
+        if not re.match(r"^\+?[0-9\s\-()]{7,20}$", val) or re.search(r"[a-zA-Z]", val):
+            raise serializers.ValidationError("Phone number must contain only valid digits and standard phone symbols.")
+        return val
+
+    def validate(self, attrs):
+        if not attrs.get("role"):
+            raise serializers.ValidationError({"role": ["Role is required. Every user must hold an assigned RBAC role."]})
+        email = attrs.get("email", "")
+        password = attrs.get("password", "")
+        if password:
+            import django.core.exceptions
+            from django.contrib.auth.password_validation import validate_password
+            temp_user = User(email=email) if email else None
+            try:
+                validate_password(password, user=temp_user)
+            except django.core.exceptions.ValidationError as e:
+                raise serializers.ValidationError({"password": list(e.messages)})
+        return attrs
 
     def create(self, validated_data):
         password = validated_data.pop("password")
@@ -67,6 +103,7 @@ class LoginRequestSerializer(serializers.Serializer):
     password = serializers.CharField(
         required=True,
         write_only=True,
+        trim_whitespace=False,
         style={"input_type": "password"},
         help_text="User account password",
     )

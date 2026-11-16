@@ -18,9 +18,12 @@ Integration notes
 """
 
 import re
+
 from django.conf import settings
-from django.shortcuts import redirect, render
-from django.views.decorators.http import require_POST
+from django.contrib.auth import logout
+from django.shortcuts import render
+from django.views.decorators.cache import never_cache
+from django.views.decorators.http import require_GET, require_POST
 
 
 def _site_url():
@@ -31,21 +34,16 @@ def _site_url():
 # Home / landing page
 # ---------------------------------------------------------------------------
 
+@never_cache
 def landing_home(request):
     """
     Root URL handler.
-
-    Anonymous → renders the public marketing home page.
-    Authenticated → delegates to the existing role-based home_view dispatcher
-                   (imported lazily to avoid circular-import risk at module load).
+    Forward authenticated users directly to their role-tailored dashboard (home_view).
+    Anonymous visitors see the public marketing home page.
     """
     if request.user.is_authenticated:
-        import sys
-        if getattr(settings, "TESTING", False) or "pytest" in sys.modules:
-            from apps.core.views import home_view  # noqa: PLC0415
-            return home_view(request)
-        from apps.core.views import get_dashboard_url_for_user  # noqa: PLC0415
-        return redirect(get_dashboard_url_for_user(request.user))
+        from apps.core.views import home_view
+        return home_view(request)
 
     context = {
         'page_title': 'ProcureSphere 360 — Intelligent Enterprise Procurement Platform',
@@ -169,10 +167,10 @@ def landing_home(request):
             {'question': 'How does the approval policy engine work?', 'answer': 'It routes decisions automatically based on custom rules like department, budget thresholds, or risk categories, ensuring the right owner reviews the request at the exact right time.'},
         ],
         'trust_cards': [
-            {'icon': 'building', 'stat': '500+', 'label': 'Global Enterprises', 'desc': 'Across global supply chains', 'color': '#3b82f6', 'tag': 'GLOBAL SCALE'},
-            {'icon': 'chart', 'stat': '$2.5B+', 'label': 'Spend Managed', 'desc': 'Annually across all modules', 'color': '#10b981', 'tag': 'SPEND VOLUME'},
+            {'icon': 'building', 'stat': '13,000+', 'label': 'Global Enterprises', 'desc': 'Across global supply chains', 'color': '#3b82f6', 'tag': 'GLOBAL SCALE'},
+            {'icon': 'chart', 'stat': '₹ 100Cr+', 'label': 'Spend Managed', 'desc': 'Annually across all modules', 'color': '#10b981', 'tag': 'SPEND VOLUME'},
             {'icon': 'receipt', 'stat': '10M+', 'label': 'Monthly Transactions', 'desc': 'Instant POs & invoices', 'color': '#f59e0b', 'tag': 'HIGH VELOCITY'},
-            {'icon': 'savings', 'stat': '₹120Cr+', 'label': 'Savings Generated', 'desc': 'Through automated negotiations', 'color': '#8b5cf6', 'tag': 'COST SAVINGS'},
+            {'icon': 'savings', 'stat': '₹ 12Cr+', 'label': 'Savings Generated', 'desc': 'Through automated negotiations', 'color': '#8b5cf6', 'tag': 'COST SAVINGS'},
             {'icon': 'users', 'stat': '800+', 'label': 'Procurement Leaders', 'desc': 'Active daily users', 'color': '#ec4899', 'tag': 'ACTIVE TEAMS'},
         ],
         'benefits': [
@@ -212,7 +210,8 @@ STAGE_SLUG_MAP = {
 
 ABOUT_SECTION_MAP = {
     'platform-introduction': 'about-overview',
-    'mission-purpose': 'mission-purpose',
+    'mission-vision': 'mission-vision',
+    'mission-purpose': 'mission-vision',
     'financial-control': 'financial-control',
     'connected-pillars': 'connected-pillars',
     'enterprise-capabilities': 'enterprise-capabilities',
@@ -220,6 +219,37 @@ ABOUT_SECTION_MAP = {
 }
 
 
+@never_cache
+@require_GET
+def roles(request):
+    """Public roles and access overview page."""
+    if request.user.is_authenticated:
+        logout(request)
+    context = {
+        'page_title': 'Enterprise Roles & Governance — ProcureSphere 360',
+        'page_description': (
+            'Explore ProcureSphere 360 role-based enterprise access governance, '
+            'multi-level approval workflows, and separation of duties.'
+        ),
+        'canonical_url': f'{_site_url()}/roles/',
+        'active_nav': 'roles',
+        'roles': [
+            {'title': 'Super Admin', 'code': 'SUPER_ADMIN', 'desc': 'Platform oversight, master policy governance, tenant setup, and complete audit access.'},
+            {'title': 'Requester', 'code': 'REQUESTER', 'desc': 'Create, track, and manage purchase requisitions within department budget allocations.'},
+            {'title': 'Department Approver', 'code': 'DEPT_APPROVER', 'desc': 'Review and authorize department purchase requisitions within approval limits.'},
+            {'title': 'Procurement Executive', 'code': 'PROC_EXEC', 'desc': 'Manage suppliers, RFQ/RFP sourcing events, bid evaluations, and purchase orders.'},
+            {'title': 'Procurement Manager', 'code': 'PROC_MGR', 'desc': 'High-value award authorizations, policy exception handling, and supplier risk governance.'},
+            {'title': 'Finance / AP', 'code': 'FINANCE_AP', 'desc': 'Budget reservations, invoice capture, automated 3-way matching, and payment execution.'},
+            {'title': 'Stores / Receiver', 'code': 'STORES_RECEIVER', 'desc': 'Receive shipments, inspect goods, log rejections, and confirm warehouse inventory.'},
+            {'title': 'Legal / Contract Manager', 'code': 'LEGAL_MGR', 'desc': 'Draft, review, and execute contracts with versioning, milestones, and SLA monitoring.'},
+            {'title': 'Compliance Auditor', 'code': 'AUDITOR', 'desc': 'Strictly read-only access to end-to-end audit trails, lifecycle traces, and exports.'},
+            {'title': 'Vendor User', 'code': 'VENDOR_USER', 'desc': 'Self-service supplier portal for KYC onboarding, RFQ/RFP bidding, and order tracking.'},
+        ],
+    }
+    return render(request, "landing/roles.html", context)
+
+
+@never_cache
 def about(request, section_slug=None):
     """About page."""
     context = {
@@ -232,7 +262,7 @@ def about(request, section_slug=None):
         'overview_title': 'Platform Introduction',
         'overview_subtitle': 'A New Era of Enterprise Procurement: Elevating procurement from a tactical back-office headache to a strategic, transparent advantage.',
         'overview_summary': 'ProcureSphere 360 is an enterprise-grade Source-to-Pay and AP automation ERP engineered to replace disconnected email exchanges, loose spreadsheets, and retrospective financial controls with a synchronized, database-backed operating picture.',
-        'mission_title': 'Platform Mission & Purpose',
+        'mission_title': 'Platform Mission & Vision',
         'mission_subtitle': 'Eliminating Disconnected Procurement and Operational Blind Spots Across the Enterprise',
         'mission_cards': [
             {
@@ -248,7 +278,7 @@ def about(request, section_slug=None):
                 'color': '#2456D6',
             },
             {
-                'tag': 'THE IMPACT',
+                'tag': 'THE VISION',
                 'title': 'Absolute Financial Assurance',
                 'desc': 'By verifying cost center allocations and reserving available funds at the requisition stage, enterprise leaders gain 100% spend visibility before money is ever legally committed.',
                 'color': '#10b981',
@@ -356,6 +386,7 @@ def about(request, section_slug=None):
 # Solutions
 # ---------------------------------------------------------------------------
 
+@never_cache
 def solutions(request, stage_slug=None):
     """Solutions page."""
     s2p_steps = [
@@ -464,6 +495,7 @@ def solutions(request, stage_slug=None):
 # Benefits
 # ---------------------------------------------------------------------------
 
+@never_cache
 def benefits(request):
     """Benefits page."""
     benefits_list = [
@@ -496,6 +528,7 @@ def benefits(request):
 # Process
 # ---------------------------------------------------------------------------
 
+@never_cache
 def process(request):
     """Process page — End-to-End Procurement Lifecycle."""
     stages = [
@@ -622,6 +655,7 @@ def process(request):
 # FAQ
 # ---------------------------------------------------------------------------
 
+@never_cache
 def faq(request):
     """FAQ page — matching AnimatedFAQ.tsx (4 accordion) + FAQPage.tsx (4 extra static cards)."""
     # These 4 match AnimatedFAQ.tsx exactly (displayed as accordion, first open)
@@ -800,14 +834,14 @@ def contact_submit(request):
             notification_type="SYSTEM",
             title=f"New Landing Contact Enquiry: {name}",
             message=f"Received a new enquiry from {name} ({email}, {country_code} {phone_clean}): {message[:120]}...",
-            target_url="/admin/core/contactenquiry/",
+            target_url="/admin/contact-enquiries/",
         )
     except Exception:
         pass
 
-    # Success: Render formatted response
-    return render(request, 'landing/partials/contact_success.html', {
-        'name': name,
-        'email': email,
-        'phone': f"{country_code} {phone_clean}",
+    # Success: Render in-place confirmation card on landing page
+    return render(request, "landing/partials/contact_success.html", {
+        "name": name,
+        "email": email,
+        "phone": f"{country_code} {phone_clean}",
     })

@@ -1,4 +1,5 @@
 {% extends base_layout|default:'base.html' %}
+{% load core_tags %}
 
 
 
@@ -32,7 +33,7 @@
 
     </div>
 
-    {% if caps.can_operate %}
+    {% if caps.can_operate and mode != 'governance' %}
 
         <div class="d-flex flex-wrap gap-2">
 
@@ -190,15 +191,15 @@
 
     <div class="row g-2 align-items-end">
 
-        <div class="col-12 col-lg-3">
+        <div class="col-12 col-md-6 col-xl-4">
 
             <label class="form-label small fw-semibold text-muted mb-1" for="f-q">Search</label>
 
-            <input id="f-q" type="search" name="q" value="{{ filter.form.q.value|default:'' }}" class="form-control form-control-sm" placeholder="Vendor no., legal name, tax ID, category">
+            <input id="f-q" type="search" name="q" value="{{ filter.form.q.value|default:'' }}" class="form-control" placeholder="Search: vendor no., legal name, tax ID, category...">
 
         </div>
 
-        <div class="col-6 col-md-4 col-lg">
+        <div class="col-12 col-sm-6 col-md-4 col-xl-3">
 
             <label class="form-label small fw-semibold text-muted mb-1" for="id_category">Category</label>
 
@@ -208,7 +209,7 @@
 
         {% if mode != 'onboarding' %}
 
-        <div class="col-6 col-md-4 col-lg">
+        <div class="col-12 col-sm-6 col-md-4 col-xl-3">
 
             <label class="form-label small fw-semibold text-muted mb-1" for="id_operational_status">Operational status</label>
 
@@ -218,7 +219,7 @@
 
         {% endif %}
 
-        <div class="col-6 col-md-4 col-lg">
+        <div class="col-12 col-sm-6 col-md-4 col-xl-2">
 
             <label class="form-label small fw-semibold text-muted mb-1" for="id_approval_status">Approval status</label>
 
@@ -226,7 +227,7 @@
 
         </div>
 
-        <div class="col-6 col-md-4 col-lg">
+        <div class="col-12 col-sm-6 col-md-4 col-xl-3">
 
             <label class="form-label small fw-semibold text-muted mb-1" for="id_risk_level">Risk</label>
 
@@ -234,7 +235,7 @@
 
         </div>
 
-        <div class="col-6 col-md-4 col-lg">
+        <div class="col-12 col-sm-6 col-md-4 col-xl-3">
 
             <label class="form-label small fw-semibold text-muted mb-1" for="id_restriction">Hold / suspension</label>
 
@@ -242,7 +243,7 @@
 
         </div>
 
-        <div class="col-6 col-md-4 col-lg">
+        <div class="col-12 col-sm-6 col-md-4 col-xl-3">
 
             <label class="form-label small fw-semibold text-muted mb-1" for="id_performance">Performance</label>
 
@@ -250,11 +251,11 @@
 
         </div>
 
-        <div class="col-12 col-lg-auto d-flex gap-2 w-100 w-lg-auto">
+        <div class="col-12 col-md-8 col-xl-3 d-flex gap-2 justify-content-xl-end">
 
-            <button type="submit" class="btn btn-primary btn-sm px-3 flex-fill flex-lg-grow-0"><i class="fa-solid fa-filter me-1"></i>Apply</button>
+            <button type="submit" class="btn btn-primary btn-sm px-3 flex-fill flex-xl-grow-0"><i class="fa-solid fa-filter me-1"></i>Apply</button>
 
-            <a href="{{ request.path }}" class="btn btn-outline-secondary btn-sm px-3 flex-fill flex-lg-grow-0 text-center">Reset</a>
+            <a href="{{ request.path }}" class="btn btn-outline-secondary btn-sm px-3 flex-fill flex-xl-grow-0 text-center">Reset</a>
 
         </div>
 
@@ -310,7 +311,7 @@
 
                     <td>
 
-                        <a href="{% url 'vendor_detail' vendor.id %}" class="fw-semibold text-decoration-none text-dark">{{ vendor.legal_name }}</a>
+                        <a href="{% if mode == 'governance' %}{% url 'vendor_detail_status' vendor.id %}?section=governance{% else %}{% url 'vendor_detail' vendor.id %}?section={{ mode|default:'master' }}{% endif %}" class="fw-semibold text-decoration-none text-dark">{{ vendor.legal_name|safe_display }}</a>
 
                         {% if vendor.trade_name %}<div class="small text-muted">{{ vendor.trade_name }}</div>{% endif %}
 
@@ -376,7 +377,7 @@
 
                         {% else %}
 
-                            <span class="badge {% if vendor.performance_band == 'good' %}bg-success{% elif vendor.performance_band == 'watch' %}bg-warning text-dark{% else %}bg-danger{% endif %}">{{ vendor.latest_composite_score|floatformat:1 }}</span>
+                            <a href="{% url 'scorecard_vendor_detail' vendor.id %}" class="text-decoration-none"><span class="badge {% if vendor.performance_band == 'good' %}bg-success{% elif vendor.performance_band == 'watch' %}bg-warning text-dark{% else %}bg-danger{% endif %}">{{ vendor.latest_composite_score|floatformat:1 }}</span></a>
 
                         {% endif %}
 
@@ -386,13 +387,16 @@
 
                     <td class="text-end pe-3 text-nowrap">
 
-                        <a href="{% url 'vendor_detail' vendor.id %}" class="btn btn-sm btn-outline-secondary" title="View"><i class="fa-solid fa-eye"></i><span class="visually-hidden">View</span></a>
+                        {% if mode == 'governance' %}
+                        <a href="{% url 'vendor_detail_status' vendor.id %}?section=governance" class="btn btn-sm btn-outline-primary" title="Governance Action & Status"><i class="fa-solid fa-scale-balanced"></i><span class="visually-hidden">Governance</span></a>
+                        {% endif %}
+                        <a href="{% url 'vendor_detail' vendor.id %}?section={{ mode|default:'master' }}" class="btn btn-sm btn-outline-secondary" title="View"><i class="fa-solid fa-eye"></i><span class="visually-hidden">View</span></a>
 
-                        <a href="{% url 'vendor_detail' vendor.id %}#risk" class="btn btn-sm btn-outline-danger" title="Risk"><i class="fa-solid fa-triangle-exclamation"></i><span class="visually-hidden">Risk</span></a>
+                        <a href="{% url 'vendor_detail_risk' vendor.id %}?section={{ mode|default:'master' }}" class="btn btn-sm btn-outline-danger" title="Risk"><i class="fa-solid fa-triangle-exclamation"></i><span class="visually-hidden">Risk</span></a>
 
-                        <a href="{% url 'vendor_detail' vendor.id %}#performance" class="btn btn-sm btn-outline-success" title="Performance"><i class="fa-solid fa-award"></i><span class="visually-hidden">Performance</span></a>
+                        <a href="{% url 'vendor_detail_performance' vendor.id %}?section={{ mode|default:'master' }}" class="btn btn-sm btn-outline-success" title="Performance"><i class="fa-solid fa-award"></i><span class="visually-hidden">Performance</span></a>
 
-                        <a href="{% url 'vendor_detail' vendor.id %}#history" class="btn btn-sm btn-outline-dark" title="History"><i class="fa-solid fa-clock-rotate-left"></i><span class="visually-hidden">History</span></a>
+                        <a href="{% url 'vendor_detail_history' vendor.id %}?section={{ mode|default:'master' }}" class="btn btn-sm btn-outline-dark" title="History"><i class="fa-solid fa-clock-rotate-left"></i><span class="visually-hidden">History</span></a>
 
                     </td>
 
@@ -474,9 +478,9 @@
 
                 <div class="mb-2">
 
-                    <a href="{% url 'vendor_detail' vendor.id %}" class="fw-bold fs-6 text-dark text-decoration-none text-break d-block mb-0">
+                    <a href="{% if mode == 'governance' %}{% url 'vendor_detail_status' vendor.id %}?section=governance{% else %}{% url 'vendor_detail' vendor.id %}?section={{ mode|default:'master' }}{% endif %}" class="fw-bold fs-6 text-dark text-decoration-none text-break d-block mb-0">
 
-                        {{ vendor.legal_name }}
+                        {{ vendor.legal_name|safe_display }}
 
                     </a>
 
@@ -538,7 +542,7 @@
 
                         {% else %}
 
-                            <span class="badge {% if vendor.performance_band == 'good' %}bg-success{% elif vendor.performance_band == 'watch' %}bg-warning text-dark{% else %}bg-danger{% endif %}">{{ vendor.latest_composite_score|floatformat:1 }}</span>
+                            <a href="{% url 'scorecard_vendor_detail' vendor.id %}" class="text-decoration-none"><span class="badge {% if vendor.performance_band == 'good' %}bg-success{% elif vendor.performance_band == 'watch' %}bg-warning text-dark{% else %}bg-danger{% endif %}">{{ vendor.latest_composite_score|floatformat:1 }}</span></a>
 
                         {% endif %}
 
@@ -560,25 +564,30 @@
 
                 <div class="d-flex align-items-center gap-1.5 justify-content-between pt-1 border-top">
 
-                    <a href="{% url 'vendor_detail' vendor.id %}" class="btn btn-sm btn-outline-primary rounded-pill px-3 py-1.5 fw-semibold flex-grow-1 text-center">
+                    {% if mode == 'governance' %}
+                    <a href="{% url 'vendor_detail_status' vendor.id %}?section=governance" class="btn btn-sm btn-primary rounded-pill px-3 py-1.5 fw-semibold text-center me-1">
+                        <i class="fa-solid fa-scale-balanced me-1"></i> Governance
+                    </a>
+                    {% endif %}
+                    <a href="{% url 'vendor_detail' vendor.id %}?section={{ mode|default:'master' }}" class="btn btn-sm btn-outline-primary rounded-pill px-3 py-1.5 fw-semibold flex-grow-1 text-center">
 
                         <i class="fa-solid fa-eye me-1"></i> View Details
 
                     </a>
 
-                    <a href="{% url 'vendor_detail' vendor.id %}#risk" class="btn btn-sm btn-outline-danger rounded-pill px-2.5 py-1.5" title="Risk Assessment">
+                    <a href="{% url 'vendor_detail_risk' vendor.id %}?section={{ mode|default:'master' }}" class="btn btn-sm btn-outline-danger rounded-pill px-2.5 py-1.5" title="Risk Assessment">
 
                         <i class="fa-solid fa-triangle-exclamation"></i>
 
                     </a>
 
-                    <a href="{% url 'vendor_detail' vendor.id %}#performance" class="btn btn-sm btn-outline-success rounded-pill px-2.5 py-1.5" title="Performance Scorecard">
+                    <a href="{% url 'vendor_detail_performance' vendor.id %}?section={{ mode|default:'master' }}" class="btn btn-sm btn-outline-success rounded-pill px-2.5 py-1.5" title="Performance Scorecard">
 
                         <i class="fa-solid fa-award"></i>
 
                     </a>
 
-                    <a href="{% url 'vendor_detail' vendor.id %}#history" class="btn btn-sm btn-outline-dark rounded-pill px-2.5 py-1.5" title="Audit History">
+                    <a href="{% url 'vendor_detail_history' vendor.id %}?section={{ mode|default:'master' }}" class="btn btn-sm btn-outline-dark rounded-pill px-2.5 py-1.5" title="Audit History">
 
                         <i class="fa-solid fa-clock-rotate-left"></i>
 
@@ -610,7 +619,9 @@
 
 
 
-<!-- Modal: Import Vendors -->
+<!-- Import-modal (master register only — governance is a read register, ASSUMP-035) -->
+
+{% if caps.can_operate and mode != 'governance' %}
 
 <div class="modal fade" id="importVendorsModal" tabindex="-1" aria-labelledby="importVendorsModalLabel" aria-hidden="true">
 
@@ -770,7 +781,7 @@
 
 </div>
 
-
+{% endif %}
 
 {% endblock %}
 
