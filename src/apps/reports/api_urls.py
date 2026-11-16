@@ -1,4 +1,5 @@
 from django.urls import path
+from drf_spectacular.utils import extend_schema
 from rest_framework import permissions, serializers, status, viewsets
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -71,7 +72,7 @@ class CanCreateExportJob(permissions.BasePermission):
 class CanViewSpendAnalytics(permissions.BasePermission):
     """
     Restricts organisation-wide spend analytics to executive, finance, and auditing roles.
-    Requesters and external vendors are strictly prohibited (403).
+    Requesters, stores receivers, and external vendors are strictly prohibited (403).
     """
 
     def has_permission(self, request, view):
@@ -79,8 +80,28 @@ class CanViewSpendAnalytics(permissions.BasePermission):
             return False
         if request.user.is_superuser:
             return True
-        role_code = getattr(request.user, "role_code", None)
-        if role_code in [Role.REQUESTER, Role.VENDOR_USER]:
+        role_code = getattr(request.user, "role_code", None) or (
+            request.user.role.code if getattr(request.user, "role", None) else None
+        )
+        if role_code in [Role.REQUESTER, Role.VENDOR_USER, Role.STORES_RECEIVER]:
+            return False
+        return True
+
+
+class CanViewSupplierPerformance(permissions.BasePermission):
+    """
+    Restricts supplier performance reports to procurement, finance, auditor and admin roles.
+    """
+
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        if request.user.is_superuser:
+            return True
+        role_code = getattr(request.user, "role_code", None) or (
+            request.user.role.code if getattr(request.user, "role", None) else None
+        )
+        if role_code in [Role.REQUESTER, Role.VENDOR_USER, Role.STORES_RECEIVER, Role.DEPT_APPROVER]:
             return False
         return True
 
@@ -91,7 +112,7 @@ class ExportJobSerializer(serializers.ModelSerializer):
     class Meta:
         model = ExportJob
         fields = "__all__"
-        read_only_fields = ["requested_by", "status", "result_file", "error_message"]
+        read_only_fields = ["requested_by", "result_file", "error_message"]
 
     def validate_report_type(self, value):
         val = str(value).strip().lower()
@@ -107,7 +128,25 @@ class ExportJobViewSet(viewsets.ModelViewSet):
     serializer_class = ExportJobSerializer
     permission_classes = [IsAuthenticated, CanCreateExportJob]
 
+    def get_queryset(self):
+        user = self.request.user
+        if not user or not user.is_authenticated:
+            return ExportJob.objects.none()
+        if user.is_superuser:
+            return self.queryset
+        return self.queryset.filter(requested_by=user)
+
     def perform_create(self, serializer):
+        report_type = serializer.validated_data.get("report_type")
+        role_code = getattr(self.request.user, "role_code", None) or (
+            self.request.user.role.code if getattr(self.request.user, "role", None) else None
+        )
+        if report_type == "audit_log" and not (self.request.user.is_superuser or role_code in [Role.SUPER_ADMIN, Role.AUDITOR]):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("Only Auditor and Super Admin can export audit logs.")
+        if report_type in ["spend_analytics", "spend"] and role_code in [Role.STORES_RECEIVER, Role.REQUESTER, Role.VENDOR_USER]:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("You do not have permission to export spend reports.")
         job = serializer.save(requested_by=self.request.user)
         generate_export_job_service(job.id)
 
@@ -118,16 +157,22 @@ def dashboard_summary_view(request):
     """
     Executes executive procurement dashboard overview combining spend, PRs, POs, Invoices, Contracts.
     """
-    pr_data = get_pr_aging_report()
-    spend_data = get_spend_analytics_report()
-    po_data = get_po_status_report()
-    inv_data = get_invoice_exception_aging_report()
+    from apps.orders.models import PurchaseOrder
+    from apps.orders.selectors import scope_purchase_orders_queryset
+    from apps.requisitions.models import PurchaseRequisition
+    from apps.vendors.models import Vendor
+    from apps.vendors.selectors import scope_vendors_queryset
+
+    pr_data = get_pr_aging_report(user=request.user)
+    spend_data = get_spend_analytics_report(user=request.user)
+    po_data = get_po_status_report(user=request.user)
+    inv_data = get_invoice_exception_aging_report(user=request.user)
     contract_data = get_contract_expiry_report(user=request.user)
     scorecard_data = get_supplier_performance_report()
 
     summary = {
-        "total_prs": len(pr_data),
-        "total_pos": len(po_data),
+        "total_prs": len(pr_data) if not request.user.is_superuser else PurchaseRequisition.objects.count(),
+        "total_pos": scope_purchase_orders_queryset(PurchaseOrder.objects.all(), request.user).count(),
         "total_spend": sum(
             float(item.get("actual_spend") or item.get("actual") or 0.0) for item in spend_data
         ),
@@ -135,7 +180,7 @@ def dashboard_summary_view(request):
         "expiring_contracts": len(
             [item for item in contract_data if 0 <= item["days_to_expiry"] <= 60]
         ),
-        "vendor_count": len(scorecard_data),
+        "vendor_count": scope_vendors_queryset(Vendor.objects.all(), request.user).count(),
     }
     return Response(summary, status=status.HTTP_200_OK)
 
@@ -143,25 +188,97 @@ def dashboard_summary_view(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated, IsNotVendorUser])
 def pr_aging_report_view(request):
-    return Response(get_pr_aging_report(), status=status.HTTP_200_OK)
+    return Response(get_pr_aging_report(user=request.user), status=status.HTTP_200_OK)
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated, CanViewSpendAnalytics])
 def spend_analytics_report_view(request):
-    return Response(get_spend_analytics_report(), status=status.HTTP_200_OK)
+    period_days = None
+    period_days_raw = request.GET.get("period_days")
+    if period_days_raw is not None and str(period_days_raw).strip() != "":
+        try:
+            period_days = int(period_days_raw)
+            if period_days < 0 or period_days > 3650:
+                return Response(
+                    {"error": {"code": "VALIDATION_ERROR", "message": "period_days must be between 0 and 3650."}},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        except (ValueError, TypeError, OverflowError):
+            return Response(
+                {"error": {"code": "VALIDATION_ERROR", "message": "period_days must be a valid integer."}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+    start_date = request.GET.get("start_date") or request.GET.get("date_from") or request.GET.get("from")
+    if start_date:
+        try:
+            from datetime import date
+            date.fromisoformat(str(start_date).strip()[:10])
+        except (ValueError, TypeError):
+            return Response(
+                {"error": {"code": "VALIDATION_ERROR", "message": "start_date must be in YYYY-MM-DD format."}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    end_date = request.GET.get("end_date") or request.GET.get("date_to") or request.GET.get("to")
+    if end_date:
+        try:
+            from datetime import date
+            date.fromisoformat(str(end_date).strip()[:10])
+        except (ValueError, TypeError):
+            return Response(
+                {"error": {"code": "VALIDATION_ERROR", "message": "end_date must be in YYYY-MM-DD format."}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    category = request.GET.get("category")
+    department = request.GET.get("department")
+    cost_center = request.GET.get("cost_center")
+    vendor = request.GET.get("vendor")
+    period = request.GET.get("period")
+
+    report_data = get_spend_analytics_report(
+        user=request.user,
+        period_days=period_days,
+        start_date=start_date,
+        end_date=end_date,
+        category=category,
+        department=department,
+        cost_center=cost_center,
+        vendor=vendor,
+        period=period,
+    )
+    return Response(report_data, status=status.HTTP_200_OK)
+
+
+@extend_schema(exclude=True)
+@api_view(["GET"])
+@permission_classes([IsAuthenticated, IsNotVendorUser])
+def reports_index_view(request):
+    reports_list = [
+        {"id": 1, "slug": "pr-aging", "title": "PR Aging and Approval Bottlenecks", "available_filters": ["department", "cost_center", "period", "status"]},
+        {"id": 2, "slug": "spend", "title": "Spend by Vendor, Category, Department, Cost Center", "available_filters": ["vendor", "category", "department", "cost_center", "period", "from", "to"]},
+        {"id": 3, "slug": "sourcing-cycle", "title": "Sourcing Cycle Time and Bid Participation", "available_filters": ["event_type", "status", "period"]},
+        {"id": 4, "slug": "po-status", "title": "Purchase Order Status", "available_filters": ["vendor", "status", "period"]},
+        {"id": 5, "slug": "receipts", "title": "Goods Receipt and Delivery Performance", "available_filters": ["vendor", "status", "start_date", "end_date"]},
+        {"id": 6, "slug": "invoice-exceptions", "title": "Invoice Match-Exception Aging", "available_filters": ["vendor", "status", "aging"]},
+        {"id": 7, "slug": "contracts", "title": "Contract Expiry, Renewal and Obligations", "available_filters": ["vendor", "status", "days", "start_date", "end_date"]},
+        {"id": 8, "slug": "supplier-score", "title": "Supplier Performance Scorecards and Trend", "available_filters": ["vendor", "period", "category"]},
+        {"id": 9, "slug": "approval-audit", "title": "User / Approval Audit Trail", "available_filters": ["actor", "action", "object", "from", "to"]},
+    ]
+    return Response(reports_list, status=status.HTTP_200_OK)
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated, IsNotVendorUser])
 def sourcing_cycle_report_view(request):
-    return Response(get_sourcing_cycle_time_report(), status=status.HTTP_200_OK)
+    return Response(get_sourcing_cycle_time_report(user=request.user), status=status.HTTP_200_OK)
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated, IsNotVendorUser])
 def po_status_report_view(request):
-    return Response(get_po_status_report(), status=status.HTTP_200_OK)
+    return Response(get_po_status_report(user=request.user), status=status.HTTP_200_OK)
 
 
 @api_view(["GET"])
@@ -203,7 +320,7 @@ def receipt_delivery_summary_view(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated, IsNotVendorUser])
 def invoice_exception_report_view(request):
-    return Response(get_invoice_exception_aging_report(), status=status.HTTP_200_OK)
+    return Response(get_invoice_exception_aging_report(user=request.user), status=status.HTTP_200_OK)
 
 
 @api_view(["GET"])
@@ -245,10 +362,21 @@ def contract_obligation_report_view(request):
 
 
 @api_view(["GET"])
-@permission_classes([IsAuthenticated, IsNotVendorUser])
+@permission_classes([IsAuthenticated, CanViewSupplierPerformance])
 def supplier_performance_report_view(request):
     return Response(get_supplier_performance_report(), status=status.HTTP_200_OK)
 
+
+class CanReadAuditLogReport(permissions.BasePermission):
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        if request.user.is_superuser:
+            return True
+        role = getattr(request.user, "role_code", None) or (
+            request.user.role.code if getattr(request.user, "role", None) else None
+        )
+        return role in [Role.SUPER_ADMIN, Role.AUDITOR]
 
 class IsAuditorOrSuperAdmin(permissions.BasePermission):
     def has_permission(self, request, view):
@@ -271,7 +399,9 @@ def audit_log_report_view(request):
 router = DefaultRouter()
 router.register(r"exports", ExportJobViewSet, basename="export-job")
 
-urlpatterns = router.urls + [
+urlpatterns = [
+    path("", reports_index_view, name="reports-index"),
+] + router.urls + [
     path("dashboard-summary/", dashboard_summary_view, name="dashboard-summary"),
     path("pr-aging/", pr_aging_report_view, name="report-pr-aging"),
     path("spend-analytics/", spend_analytics_report_view, name="report-spend-analytics"),

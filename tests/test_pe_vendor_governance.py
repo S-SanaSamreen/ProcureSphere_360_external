@@ -10,6 +10,7 @@ from datetime import timedelta
 import pytest
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.urls import reverse
 from django.utils import timezone
 
 from apps.audit.models import AuditLog
@@ -28,13 +29,13 @@ from apps.vendors.services import (
 pytestmark = [pytest.mark.django_db, pytest.mark.regression]
 
 
-def upload_doc(world, vendor_key, user_key, name="kyc.pdf"):
+def upload_doc(world, vendor_key, user_key, name="kyc.pdf", doc_type="TAX_CLEARANCE", title=None):
     return upload_vendor_document_service(
         vendor=world[vendor_key],
         user=world[user_key],
         file=SimpleUploadedFile(name, b"%PDF-1.4 test", content_type="application/pdf"),
-        document_type="TAX_CLEARANCE",
-        title=f"{vendor_key} tax",
+        document_type=doc_type,
+        title=title or f"{vendor_key} tax",
     )
 
 
@@ -71,20 +72,22 @@ class TestGovernancePages:
             notes="Thin margins",
         )
         client.force_login(w["exec"])
-        body = client.get(f"/vendors/{w['vendor_a'].id}/").content.decode()
-        for expected in [
-            "Alpha Hardware Ltd",
-            "Hardware",
-            "Medium Risk",
-            "Financial stability",
-            "Thin margins",
-            "No performance data available.",
-            "vendor_a tax",
-            "Ada Lovelace",
-            "Change history",
-            "Open exposure",
-        ]:
-            assert expected in body, expected
+        # Each section is now an independent page; assert the section content on its own route.
+        vendor = w["vendor_a"]
+        page_expectations = [
+            (f"/vendors/{vendor.id}/overview/", ["Alpha Hardware Ltd", "Hardware", "Operational summary"]),
+            (f"/vendors/{vendor.id}/status/", ["Open exposure", "KYC &amp; activation status"]),
+            (f"/vendors/{vendor.id}/risk/", ["Medium Risk", "Financial stability", "Thin margins"]),
+            (f"/vendors/{vendor.id}/performance/", ["No performance data available."]),
+            (f"/vendors/{vendor.id}/documents/", ["vendor_a tax", "Download"]),
+            (f"/vendors/{vendor.id}/contacts/", ["Ada Lovelace"]),
+            (f"/vendors/{vendor.id}/sourcing/", ["Open exposure", "Purchase orders"]),
+            (f"/vendors/{vendor.id}/history/", ["Change history"]),
+        ]
+        for url, expected_items in page_expectations:
+            body = client.get(url).content.decode()
+            for expected in expected_items:
+                assert expected in body, f"{expected} missing on {url}"
 
     @pytest.mark.parametrize("user_key", ["requester", "stores", "user_a"])
     def test_pages_forbidden_for_unauthorised_roles(self, client, procurement_world, user_key):
@@ -94,7 +97,8 @@ class TestGovernancePages:
             assert client.get(url).status_code == 403, url
         assert (
             client.post(
-                f"/vendors/{w['vendor_b'].id}/status/", {"status": "ON_HOLD", "notes": "x"}
+                reverse("vendor_status_change", args=[w["vendor_b"].id]),
+                {"status": "ON_HOLD", "notes": "x"},
             ).status_code
             == 403
         )
@@ -108,11 +112,58 @@ class TestGovernancePages:
             assert client.get(f"/vendors/{w['vendor_a'].id}/").status_code == 200
             assert (
                 client.post(
-                    f"/vendors/{w['vendor_a'].id}/risk/", {"risk_level": "HIGH", "notes": "x"}
+                    reverse("vendor_risk_assess", args=[w["vendor_a"].id]),
+                    {"risk_level": "HIGH", "notes": "x"},
                 ).status_code
                 == 403
             )
         assert not VendorRiskRecord.objects.exists()
+
+    def test_proc_exec_vendor_status_governance_action_active_only_in_governance_section(self, client, procurement_world):
+        """
+        Procurement Executive dashboard:
+        - In 'Vendor Master & Risk' section, status page shows ONLY KYC & activation status (governance action form is hidden).
+        - In 'Vendor Governance' section, governance action dropdown, reason textarea, and apply button are active.
+        """
+        w = procurement_world
+        vendor = w["vendor_a"]
+        client.force_login(w["exec"])
+
+        # 1. Vendor Master & Risk section (default or ?section=master)
+        resp_master = client.get(f"/vendors/{vendor.id}/status/?section=master")
+        assert resp_master.status_code == 200
+        content_master = resp_master.content.decode()
+        assert "KYC &amp; activation status" in content_master
+        assert "Governance action" not in content_master
+        assert 'name="notes"' not in content_master
+        assert '<button type="submit" class="btn btn-sm btn-dark">Apply</button>' not in content_master
+
+        # 2. Vendor Governance section (?section=governance)
+        resp_gov = client.get(f"/vendors/{vendor.id}/status/?section=governance")
+        assert resp_gov.status_code == 200
+        content_gov = resp_gov.content.decode()
+        assert "KYC &amp; activation status" in content_gov
+        assert "Governance action" in content_gov
+        assert "Reason (recorded in audit trail)" in content_gov
+        assert 'name="notes"' in content_gov
+        assert 'id="gov-status"' in content_gov
+        assert '<button type="submit" class="btn btn-sm btn-dark">Apply</button>' in content_gov
+
+    def test_proc_exec_sidebar_does_not_contain_immutable_audit_report(self, client, procurement_world):
+        """
+        Procurement Executive dashboard sidebar must NOT contain Immutable Audit Report,
+        while maintaining reports (PR Aging, Sourcing Cycle, PO Status).
+        """
+        w = procurement_world
+        client.force_login(w["exec"])
+        resp = client.get("/procurement/")
+        assert resp.status_code == 200
+        content = resp.content.decode()
+        assert "Immutable Audit Report" not in content
+        assert reverse("proc_exec_audit_report") not in content
+        assert "PR Aging" in content
+        assert "Sourcing Cycle" in content
+        assert "PO Status" in content
 
 
 class TestSearchFilterPagination:
@@ -319,11 +370,13 @@ class TestRiskAndStatusGovernance:
         w = procurement_world
         client.force_login(w["exec"])
         res = client.post(
-            f"/vendors/{w['vendor_b'].id}/status/", {"status": "SUSPENDED", "notes": "x"}
+            reverse("vendor_status_change", args=[w["vendor_b"].id]),
+            {"status": "SUSPENDED", "notes": "x"},
         )
         assert res.status_code == 403
         res = client.post(
-            f"/vendors/{w['vendor_b'].id}/status/", {"status": "ON_HOLD", "notes": "Late KYC"}
+            reverse("vendor_status_change", args=[w["vendor_b"].id]),
+            {"status": "ON_HOLD", "notes": "Late KYC"},
         )
         assert res.status_code == 302
         w["vendor_b"].refresh_from_db()
@@ -337,10 +390,37 @@ class TestRiskAndStatusGovernance:
         client.post(f"/vendors/{vendor.id}/kyc/verify-document/", {"document_id": str(doc.id)})
         doc.refresh_from_db()
         assert doc.is_verified and doc.verified_by == w["exec"]
+
+        # DEF-006 negative check: missing mandatory INC_CERT and BANK_LETTER blocks activation
+        client.post(f"/vendors/{vendor.id}/kyc/approve/", {"notes": "Incomplete KYC"})
+        vendor.refresh_from_db()
+        assert vendor.status == Vendor.STATUS_KYC_REVIEW
+
+        # Upload and verify remaining mandatory documents before final governance activation
+        for doc_type, filename, label in (
+            ("INC_CERT", "inc.pdf", "Certificate of Incorporation"),
+            ("BANK_LETTER", "bank.pdf", "Bank Verification Document"),
+        ):
+            extra_doc = upload_doc(
+                w, "vendor_kyc", "exec", name=filename, doc_type=doc_type, title=label
+            )
+            client.post(
+                f"/vendors/{vendor.id}/kyc/verify-document/",
+                {"document_id": str(extra_doc.id)},
+            )
+
+        # Document verification alone must not bypass governance activation
+        vendor.refresh_from_db()
+        assert vendor.status == Vendor.STATUS_KYC_REVIEW
+
         client.post(f"/vendors/{vendor.id}/kyc/approve/", {"notes": "KYC complete"})
         vendor.refresh_from_db()
         assert vendor.status == Vendor.STATUS_ACTIVE
+        assert vendor.status_notes == "KYC complete"
         assert AuditLog.objects.filter(target_model="VendorDocument", action="VERIFY").exists()
+        assert AuditLog.objects.filter(
+            target_model="Vendor", target_object_id=str(vendor.id), action=AuditLog.ACTION_APPROVE
+        ).exists()
 
 
 class TestPerformance:
@@ -475,7 +555,7 @@ class TestDocumentsAndApiSecurity:
         api_client.force_authenticate(procurement_world["requester"])
         assert api_client.get("/api/v1/vendors/").status_code == 403
         assert api_client.get("/api/v1/sourcing-events/events/").status_code == 403
-        assert api_client.get("/api/v1/scorecards/").json()["count"] == 0
+        assert api_client.get("/api/v1/scorecards/").status_code == 403
 
     def test_governance_api_actions_and_structured_errors(self, api_client, procurement_world):
         w = procurement_world

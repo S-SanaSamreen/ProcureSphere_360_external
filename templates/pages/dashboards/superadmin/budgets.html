@@ -6,7 +6,7 @@
 <div class="row mb-4">
     <div class="col-12 d-flex flex-column flex-sm-row justify-content-between align-items-start align-items-sm-center gap-3">
         <div>
-            <h3 class="fw-bold text-dark mb-1"><i class="fa-solid fa-sack-dollar text-warning me-2"></i> Budget Allocations</h3>
+            <h3 class="fw-bold text-dark mb-1">Budget Allocations</h3>
             <p class="text-muted mb-0">View financial limits and consumption per cost center for the active fiscal period.</p>
         </div>
         <div class="d-flex flex-wrap gap-2 w-100 w-sm-auto">
@@ -16,7 +16,6 @@
             <button hx-get="/superadmin/budgets/create/" hx-target="#modal-content-body" data-bs-toggle="modal" data-bs-target="#modal-container" class="btn btn-primary text-white fw-bold rounded-pill px-3 px-sm-4 shadow-sm flex-fill flex-sm-grow-0 text-nowrap">
                 <i class="fa-solid fa-plus me-1"></i> Add Budget
             </button>
-            </button>
         </div>
     </div>
 </div>
@@ -24,7 +23,7 @@
 <div class="card border-0 shadow-sm rounded-4 mb-4">
     <div class="card-body p-0">
         <div class="px-4 py-3 border-bottom">
-            <h5 class="fw-bold text-dark mb-0"><i class="fa-solid fa-calendar-days text-primary me-2"></i>Fiscal Periods</h5>
+            <h5 class="fw-bold text-dark mb-0">Fiscal Periods</h5>
             <p class="text-muted small mb-0">Set the name and start/end dates. These periods appear in the budget allocation dropdown.</p>
         </div>
         <!-- Mobile Card View (< 768px) -->
@@ -98,12 +97,18 @@
     </div>
 </div>
 
-<div class="card border-0 shadow-sm rounded-4">
+<div class="card border-0 shadow-sm rounded-4" id="budgetCard">
     <div class="card-body p-0">
+        <div class="px-4 py-3 border-bottom d-flex flex-column flex-sm-row justify-content-between align-items-start align-items-sm-center gap-2" id="budgetCardHeader">
+            <div>
+                <h5 class="fw-bold text-dark mb-0">Cost Center Budgets</h5>
+                <p class="text-muted small mb-0">Financial tracking and spend consumption limits allocated per cost center.</p>
+            </div>
+        </div>
         <!-- Mobile Card View (< 768px) -->
         <div class="list-group list-group-flush d-md-none">
             {% for b in budgets %}
-            <div class="list-group-item p-3 border-bottom">
+            <div class="list-group-item p-3 border-bottom{% if forloop.counter > 5 %} budget-extra-row d-none{% endif %}">
                 <div class="d-flex justify-content-between align-items-start gap-2 mb-2">
                     <div>
                         <span class="badge bg-secondary bg-opacity-10 text-dark fw-bold font-monospace px-2 py-1 rounded small">{{ b.cost_center.code }}</span>
@@ -115,15 +120,15 @@
                 <div class="row g-2 pt-2 border-top small text-center">
                     <div class="col-4">
                         <div class="text-muted" style="font-size: 0.72rem;">Allocated</div>
-                        <div class="fw-bold text-dark">${{ b.allocated_amount|floatformat:2 }}</div>
+                        <div class="fw-bold text-dark">₹{{ b.allocated_amount|floatformat:2 }}</div>
                     </div>
                     <div class="col-4">
                         <div class="text-muted" style="font-size: 0.72rem;">Actual Spend</div>
-                        <div class="fw-bold text-danger">${{ b.actual_amount|floatformat:2 }}</div>
+                        <div class="fw-bold text-danger">₹{{ b.actual_amount|floatformat:2 }}</div>
                     </div>
                     <div class="col-4">
                         <div class="text-muted" style="font-size: 0.72rem;">Available</div>
-                        <div class="fw-bold text-success">${{ b.available_amount|floatformat:2 }}</div>
+                        <div class="fw-bold text-success">₹{{ b.available_amount|floatformat:2 }}</div>
                     </div>
                 </div>
             </div>
@@ -149,14 +154,14 @@
                 </thead>
                 <tbody>
                     {% for b in budgets %}
-                    <tr>
+                    <tr{% if forloop.counter > 5 %} class="budget-extra-row d-none"{% endif %}>
                         <td class="ps-4 fw-bold text-dark">{{ b.cost_center.code }} - {{ b.cost_center.name }}</td>
                         <td>{{ b.fiscal_period.name }}</td>
-                        <td class="text-end fw-bold">${{ b.allocated_amount|floatformat:2 }}</td>
-                        <td class="text-end text-warning">${{ b.reserved_amount|floatformat:2 }}</td>
-                        <td class="text-end text-primary">${{ b.committed_amount|floatformat:2 }}</td>
-                        <td class="text-end text-danger fw-bold">${{ b.actual_amount|floatformat:2 }}</td>
-                        <td class="text-end text-success fw-bold">${{ b.available_amount|floatformat:2 }}</td>
+                        <td class="text-end fw-bold">₹{{ b.allocated_amount|floatformat:2 }}</td>
+                        <td class="text-end text-warning">₹{{ b.reserved_amount|floatformat:2 }}</td>
+                        <td class="text-end text-primary">₹{{ b.committed_amount|floatformat:2 }}</td>
+                        <td class="text-end text-danger fw-bold">₹{{ b.actual_amount|floatformat:2 }}</td>
+                        <td class="text-end text-success fw-bold">₹{{ b.available_amount|floatformat:2 }}</td>
                         <td class="pe-4 text-end">
                             <button hx-get="/superadmin/budgets/{{ b.pk }}/edit/" hx-target="#modal-content-body" data-bs-toggle="modal" data-bs-target="#modal-container" class="btn btn-sm btn-outline-secondary rounded-pill px-3">Edit</button>
                         </td>
@@ -170,5 +175,40 @@
             </table>
         </div>
     </div>
+    {% if budgets|length > 5 %}
+    <div class="card-footer bg-white border-top py-3 text-center">
+        <button type="button" class="btn btn-sm btn-outline-primary rounded-pill px-4 fw-semibold shadow-2xs" id="toggleBudgetsBtn" onclick="toggleBudgetRows({{ budgets|length|add:'-5' }})">
+            <span id="toggleBudgetsText"><i class="fa-solid fa-chevron-down me-1"></i> Show More ({{ budgets|length|add:'-5' }} more)</span>
+        </button>
+    </div>
+    {% endif %}
 </div>
+
+<script>
+    function toggleBudgetRows(remainingCount) {
+        var extraRows = document.querySelectorAll('.budget-extra-row');
+        var btnText = document.getElementById('toggleBudgetsText');
+        if (!extraRows.length || !btnText) return;
+
+        var isCurrentlyHidden = extraRows[0].classList.contains('d-none');
+
+        extraRows.forEach(function(row) {
+            if (isCurrentlyHidden) {
+                row.classList.remove('d-none');
+            } else {
+                row.classList.add('d-none');
+            }
+        });
+
+        if (isCurrentlyHidden) {
+            btnText.innerHTML = '<i class="fa-solid fa-chevron-up me-1"></i> Show Less';
+        } else {
+            btnText.innerHTML = '<i class="fa-solid fa-chevron-down me-1"></i> Show More (' + remainingCount + ' more)';
+            var headerEl = document.getElementById('budgetCardHeader');
+            if (headerEl) {
+                headerEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            }
+        }
+    }
+</script>
 {% endblock %}

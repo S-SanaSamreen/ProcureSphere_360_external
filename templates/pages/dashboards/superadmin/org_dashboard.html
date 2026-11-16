@@ -16,9 +16,9 @@
 
         <ol class="breadcrumb sa-breadcrumb mb-0 small">
 
-            <li class="breadcrumb-item"><a href="/superadmin/" class="text-decoration-none text-muted"><i class="fa-solid fa-shield-halved me-1"></i>Super Admin</a></li>
+            <li class="breadcrumb-item"><a href="{% if '/admin/' in request.path %}/admin/{% else %}/superadmin/{% endif %}" class="text-decoration-none text-muted"><i class="fa-solid fa-shield-halved me-1"></i>Super Admin</a></li>
 
-            <li class="breadcrumb-item"><a href="/superadmin/organizations/" class="text-decoration-none text-muted">Organizations</a></li>
+            <li class="breadcrumb-item"><a href="{% if '/admin/' in request.path %}/admin/organizations/{% else %}/superadmin/organizations/{% endif %}" class="text-decoration-none text-muted">Organizations</a></li>
 
             <li class="breadcrumb-item active fw-bold text-dark text-truncate" style="max-width: 260px;" aria-current="page" title="{{ org.name }} ({{ org.code }})">{{ org.name }} ({{ org.code }})</li>
 
@@ -92,13 +92,13 @@
 
                 <div class="d-flex align-items-center gap-2 flex-nowrap overflow-x-auto pb-1 pb-sm-0 flex-shrink-0 ms-lg-auto" style="scrollbar-width: none;">
 
-                    <a href="/superadmin/organizations/" class="btn btn-outline-dark rounded-pill px-3 btn-sm text-nowrap d-inline-flex align-items-center justify-content-center">
+                    <a href="{% if '/admin/' in request.path %}/admin/organizations/{% else %}/superadmin/organizations/{% endif %}" class="btn btn-outline-dark rounded-pill px-3 btn-sm text-nowrap d-inline-flex align-items-center justify-content-center">
 
                         <i class="fa-solid fa-arrow-left me-1.5"></i> Back to Organizations
 
                     </a>
 
-                    <button type="button" hx-get="/superadmin/organizations/{{ org.pk }}/view/" hx-target="#modal-content-body" data-bs-toggle="modal" data-bs-target="#modal-container" class="btn btn-outline-info rounded-pill px-3 btn-sm text-nowrap d-inline-flex align-items-center justify-content-center" title="View Quick Details Modal">
+                    <button type="button" hx-get="{% if '/admin/' in request.path %}/admin/organizations/{% else %}/superadmin/organizations/{% endif %}{{ org.pk }}/view/" hx-target="#modal-content-body" data-bs-toggle="modal" data-bs-target="#modal-container" class="btn btn-outline-info rounded-pill px-3 btn-sm text-nowrap d-inline-flex align-items-center justify-content-center" title="View Quick Details Modal">
 
                         <i class="fa-solid fa-circle-info me-1.5"></i> Quick Summary
 
@@ -106,7 +106,7 @@
 
                     {% if is_global_superadmin %}
 
-                    <button type="button" hx-get="/superadmin/organizations/{{ org.pk }}/edit/" hx-target="#modal-content-body" data-bs-toggle="modal" data-bs-target="#modal-container" class="btn btn-outline-secondary rounded-pill px-3 btn-sm text-nowrap d-inline-flex align-items-center justify-content-center" title="Edit Organization Master Data">
+                    <button type="button" hx-get="{% if '/admin/' in request.path %}/admin/organizations/{% else %}/superadmin/organizations/{% endif %}{{ org.pk }}/edit/" hx-target="#modal-content-body" data-bs-toggle="modal" data-bs-target="#modal-container" class="btn btn-outline-secondary rounded-pill px-3 btn-sm text-nowrap d-inline-flex align-items-center justify-content-center" title="Edit Organization Master Data">
 
                         <i class="fa-solid fa-pen-to-square me-1.5"></i> Edit
 
@@ -360,7 +360,7 @@
 
                 <span class="text-muted small fw-semibold text-uppercase d-block">Allocated Budget</span>
 
-                <span class="fs-4 fw-bold text-success">${{ allocated_budget|floatformat:2 }}</span>
+                <span class="fs-4 fw-bold text-success">₹{{ allocated_budget|floatformat:2 }}</span>
 
             </div>
 
@@ -368,7 +368,7 @@
 
                 <span class="text-muted small fw-semibold text-uppercase d-block">Actual Spend</span>
 
-                <span class="fs-4 fw-bold text-dark">${{ actual_budget|floatformat:2 }}</span>
+                <span class="fs-4 fw-bold text-dark">₹{{ actual_budget|floatformat:2 }}</span>
 
             </div>
 
@@ -376,7 +376,7 @@
 
                 <span class="text-muted small fw-semibold text-uppercase d-block">Committed / Reserved</span>
 
-                <span class="fs-4 fw-bold text-secondary">${{ committed_budget|add:reserved_budget|floatformat:2 }}</span>
+                <span class="fs-4 fw-bold text-secondary">₹{{ committed_budget|add:reserved_budget|floatformat:2 }}</span>
 
             </div>
 
@@ -384,7 +384,7 @@
 
                 <span class="text-muted small fw-semibold text-uppercase d-block">Available Remaining</span>
 
-                <span class="fs-4 fw-bold text-primary">${{ available_budget|floatformat:2 }}</span>
+                <span class="fs-4 fw-bold text-primary">₹{{ available_budget|floatformat:2 }}</span>
 
             </div>
 
@@ -826,7 +826,7 @@
 
                             <select name="status" class="form-select form-select-sm">
 
-                                <option value="">Status</option>
+                                <option value="">-- All Statuses --</option>
 
                                 <option value="active" {% if status_filter == 'active' %}selected{% endif %}>Active</option>
 
@@ -1270,7 +1270,7 @@
 
                                         </button>
 
-                                        <form method="POST" action="/superadmin/locations/{{ loc.pk }}/delete/" onsubmit="return confirm('Delete location {{ loc.name }}?');" class="d-inline m-0">
+                                        <form method="POST" action="/superadmin/locations/{{ loc.pk }}/delete/" onsubmit="if (!confirm('Delete location {{ loc.name }}?')) { if (window.resetButtonLoading && this._ps360_clickedSubmitBtn) window.resetButtonLoading(this._ps360_clickedSubmitBtn); delete this.dataset.submitting; return false; }" class="d-inline m-0">
 
                                             {% csrf_token %}
 
@@ -1430,7 +1430,7 @@
 
                                     <td>{{ pr.department.name }}</td>
 
-                                    <td class="fw-bold text-dark">${{ pr.total_amount|floatformat:2 }}</td>
+                                    <td class="fw-bold text-dark">₹{{ pr.total_amount|floatformat:2 }}</td>
 
                                     <td>
 
@@ -1958,7 +1958,7 @@
 
                                     <td><span class="badge bg-light text-dark border">{{ po.cost_center.code }}</span></td>
 
-                                    <td class="fw-bold text-dark">${{ po.total_amount|floatformat:2 }}</td>
+                                    <td class="fw-bold text-dark">₹{{ po.total_amount|floatformat:2 }}</td>
 
                                     <td>
 
@@ -2136,15 +2136,15 @@
 
                                     <td><span class="badge bg-light text-dark border">{{ b.fiscal_period.name }}</span></td>
 
-                                    <td class="fw-bold text-success">${{ b.allocated_amount|floatformat:2 }}</td>
+                                    <td class="fw-bold text-success">₹{{ b.allocated_amount|floatformat:2 }}</td>
 
-                                    <td class="text-muted">${{ b.reserved_amount|floatformat:2 }}</td>
+                                    <td class="text-muted">₹{{ b.reserved_amount|floatformat:2 }}</td>
 
-                                    <td class="text-muted">${{ b.committed_amount|floatformat:2 }}</td>
+                                    <td class="text-muted">₹{{ b.committed_amount|floatformat:2 }}</td>
 
-                                    <td class="fw-bold text-dark">${{ b.actual_amount|floatformat:2 }}</td>
+                                    <td class="fw-bold text-dark">₹{{ b.actual_amount|floatformat:2 }}</td>
 
-                                    <td class="fw-bold text-primary">${{ b.available_amount|floatformat:2 }}</td>
+                                    <td class="fw-bold text-primary">₹{{ b.available_amount|floatformat:2 }}</td>
 
                                 </tr>
 
@@ -2208,7 +2208,7 @@
 
                                             <td class="small">{{ inv.vendor.legal_name }}</td>
 
-                                            <td class="fw-bold">${{ inv.total_amount|floatformat:2 }}</td>
+                                            <td class="fw-bold">₹{{ inv.total_amount|floatformat:2 }}</td>
 
                                             <td><span class="badge bg-light text-dark border">{{ inv.get_status_display }}</span></td>
 
