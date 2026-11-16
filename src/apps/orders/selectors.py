@@ -16,29 +16,29 @@ def scope_purchase_orders_queryset(qs, user):
     """
     if not user or not user.is_authenticated:
         return qs.none()
-    if user.is_superuser:
-        return qs
 
     role_code = getattr(user, "role_code", None) or (
         user.role.code if hasattr(user, "role") and user.role else None
     )
+
+    if user.is_superuser or role_code == Role.SUPER_ADMIN:
+        return qs
 
     # Vendor scoping
     if getattr(user, "is_vendor", False) or role_code == Role.VENDOR_USER:
         vendor_id = getattr(user, "vendor_id", None)
         return qs.filter(vendor_id=vendor_id) if vendor_id else qs.none()
 
-    # Requester scoping (department-level)
+    # Requester scoping: only POs originating from own PRs or created by user
     if role_code == Role.REQUESTER:
-        if getattr(user, "department_id", None):
-            return qs.filter(cost_center__department_id=user.department_id)
-        return qs.none()
+        return qs.filter(Q(created_by=user) | Q(requisition__requester=user))
 
     # Organization-level scoping for internal roles (Auditor, Procurement Manager, etc.)
     scoped_org = getattr(user, "effective_organization", None)
     if scoped_org:
         return qs.filter(
-            Q(cost_center__department__organization=scoped_org)
+            Q(created_by=user)
+            | Q(cost_center__department__organization=scoped_org)
             | Q(requisition__department__organization=scoped_org)
             | Q(cost_center__isnull=True, requisition__isnull=True)
         )

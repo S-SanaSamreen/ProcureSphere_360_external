@@ -34,19 +34,47 @@ def create_audit_log_service(
     ip_address: Optional[str] = None,
     request_id: Optional[str] = None,
     user_agent: str = "",
+    request=None,
 ) -> AuditLog:
     """
     Centralized service to append an immutable AuditLog record across ProcureSphere 360.
-    Automatically retrieves thread-local actor, request_id, and client IP if omitted.
+    Automatically retrieves thread-local actor, request_id, and client IP if omitted,
+    or extracts them from the optional HTTP request object.
+    Supports headless services and background tasks safely without crashing.
     """
+    if request is not None:
+        if actor is None and hasattr(request, "user") and getattr(request.user, "is_authenticated", False):
+            actor = request.user
+        if request_id is None:
+            request_id = getattr(request, "request_id", None) or (
+                request.headers.get("X-Request-ID") if hasattr(request, "headers") else None
+            )
+        if ip_address is None and hasattr(request, "META"):
+            x_forwarded_for = request.META.get("HTTP_X_FORWARDED_FOR")
+            if x_forwarded_for and x_forwarded_for.strip():
+                ip_address = x_forwarded_for.split(",")[0].strip()
+            else:
+                ip_address = request.META.get("REMOTE_ADDR")
+        if not user_agent and hasattr(request, "META"):
+            user_agent = request.META.get("HTTP_USER_AGENT", "")
+
     if actor is None:
-        actor = get_current_user()
+        try:
+            actor = get_current_user()
+        except Exception:
+            actor = None
 
     if request_id is None:
-        request_id = get_current_request_id() or ""
+        try:
+            request_id = get_current_request_id() or ""
+        except Exception:
+            request_id = ""
 
     if ip_address is None:
-        ip_address = get_client_ip()
+        try:
+            ip_address = get_client_ip()
+        except Exception:
+            ip_address = None
 
     if target_object_id is not None:
         target_object_id = str(target_object_id)
@@ -61,8 +89,8 @@ def create_audit_log_service(
         previous_state=previous_state,
         new_state=new_state,
         ip_address=ip_address,
-        request_id=request_id,
-        user_agent=user_agent,
+        request_id=request_id or "",
+        user_agent=user_agent or "",
     )
 
 
@@ -83,7 +111,7 @@ def detect_entity_type(identifier: str) -> str:
         return "RECEIPT"
     elif id_upper.startswith("CON-") or id_upper.startswith("CTR-"):
         return "CONTRACT"
-    elif id_upper.startswith("VEND-") or id_upper.startswith("TIN-") or id_upper.startswith("TAX-"):
+    elif id_upper.startswith("VEND-") or id_upper.startswith("VND-") or id_upper.startswith("TIN-") or id_upper.startswith("TAX-"):
         return "VENDOR"
     return "UNKNOWN"
 
@@ -91,6 +119,7 @@ def detect_entity_type(identifier: str) -> str:
 def get_transaction_lifecycle_service(  # noqa: C901
     entity_type: Optional[str] = None,
     entity_identifier: str = "",
+    organization: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Constructs an end-to-end Source-to-Pay (S2P) lifecycle graph from any starting node:
@@ -321,6 +350,46 @@ def get_transaction_lifecycle_service(  # noqa: C901
     # If still not found, return empty payload
     if not lifecycle["is_found"]:
         return lifecycle
+
+    # Enforce organization authorization check on root object
+    if organization:
+        is_authorized = False
+        if pr_obj:
+            is_authorized = bool(pr_obj.department and pr_obj.department.organization_id == organization.id)
+        elif po_objs:
+            po = po_objs[0]
+            is_authorized = bool(
+                (po.cost_center and po.cost_center.department.organization_id == organization.id)
+                or (po.requisition and po.requisition.department.organization_id == organization.id)
+                or (po.vendor and po.vendor.organization_id == organization.id)
+            )
+        elif src_obj:
+            is_authorized = bool(src_obj.requisition and src_obj.requisition.department.organization_id == organization.id)
+        elif inv_objs:
+            inv = inv_objs[0]
+            is_authorized = bool(
+                (inv.po and inv.po.cost_center and inv.po.cost_center.department.organization_id == organization.id)
+                or (inv.vendor and inv.vendor.organization_id == organization.id)
+            )
+        elif grn_objs:
+            grn = grn_objs[0]
+            is_authorized = bool(
+                grn.po and (
+                    (grn.po.cost_center and grn.po.cost_center.department.organization_id == organization.id)
+                    or (grn.po.vendor and grn.po.vendor.organization_id == organization.id)
+                )
+            )
+        elif con_objs:
+            con = con_objs[0]
+            is_authorized = bool(con.vendor and con.vendor.organization_id == organization.id)
+        elif vendor_obj:
+            is_authorized = bool(vendor_obj.organization_id == organization.id)
+
+        if not is_authorized:
+            lifecycle["is_found"] = False
+            lifecycle["is_unauthorized"] = True
+            lifecycle["root_entity"] = None
+            return lifecycle
 
     # 2. Traverse Graph Connections Across Modules (Bidirectional Expansion)
     for _ in range(3):  # Multi-pass expansion to connect all nodes across the S2P chain
@@ -811,9 +880,11 @@ def get_transaction_lifecycle_service(  # noqa: C901
     # 4. Aggregated Chronological Audit Trail Across All Graph Nodes
     if tracked_object_ids:
         audit_query = Q(target_object_id__in=tracked_object_ids)
-        logs = (
-            AuditLog.objects.filter(audit_query).select_related("actor").order_by("timestamp")[:100]
-        )
+        logs_qs = AuditLog.objects.filter(audit_query).select_related("actor")
+        if organization:
+            from .selectors import get_scoped_audit_logs_queryset
+            logs_qs = get_scoped_audit_logs_queryset(logs_qs, organization=organization)
+        logs = logs_qs.order_by("timestamp")[:100]
         for log in logs:
             lifecycle["audit_logs"].append(
                 {
@@ -839,6 +910,7 @@ def export_auditor_data_service(  # noqa: C901
     filters: Optional[Dict[str, Any]] = None,
     actor: Optional[Any] = None,
     request: Optional[Any] = None,
+    organization: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Generates structured export data (CSV or JSON) for Auditor Dashboard domains,
@@ -846,6 +918,12 @@ def export_auditor_data_service(  # noqa: C901
     """
     import csv
     import io
+
+    if organization is None:
+        if actor and not actor.is_superuser:
+            organization = getattr(actor, "effective_organization", None) or getattr(actor, "organization", None)
+        elif request and request.user and not request.user.is_superuser:
+            organization = getattr(request.user, "effective_organization", None) or getattr(request.user, "organization", None)
 
     from .selectors import (
         get_approval_history_audit,
@@ -873,6 +951,7 @@ def export_auditor_data_service(  # noqa: C901
             target_model=filters.get("target_model"),
             search_term=filters.get("search"),
             limit=500,
+            organization=organization,
         )
         headers = [
             "ID",
@@ -904,6 +983,7 @@ def export_auditor_data_service(  # noqa: C901
             kyc_status=filters.get("kyc_status"),
             search=filters.get("search"),
             limit=500,
+            organization=organization,
         )
         headers = [
             "Vendor Number",
@@ -937,6 +1017,7 @@ def export_auditor_data_service(  # noqa: C901
             action=filters.get("action"),
             search=filters.get("search"),
             limit=500,
+            organization=organization,
         )
         headers = [
             "Timestamp",
@@ -968,6 +1049,7 @@ def export_auditor_data_service(  # noqa: C901
             event_type=filters.get("event_type"),
             search=filters.get("search"),
             limit=500,
+            organization=organization,
         )
         headers = [
             "Event Number",
@@ -1000,6 +1082,7 @@ def export_auditor_data_service(  # noqa: C901
             status=filters.get("status"),
             search=filters.get("search"),
             limit=500,
+            organization=organization,
         )
         headers = [
             "PO Number",
@@ -1031,6 +1114,7 @@ def export_auditor_data_service(  # noqa: C901
             exception_type=filters.get("exception_type"),
             search=filters.get("search"),
             limit=500,
+            organization=organization,
         )
         headers = [
             "Invoice Number",
@@ -1061,6 +1145,7 @@ def export_auditor_data_service(  # noqa: C901
             status=filters.get("status"),
             search=filters.get("search"),
             limit=500,
+            organization=organization,
         )
         headers = [
             "Contract Number",
@@ -1095,6 +1180,7 @@ def export_auditor_data_service(  # noqa: C901
             action=filters.get("action"),
             search=filters.get("search"),
             limit=500,
+            organization=organization,
         )
         headers = [
             "Timestamp",
@@ -1125,6 +1211,7 @@ def export_auditor_data_service(  # noqa: C901
         lifecycle_data = get_transaction_lifecycle_service(
             entity_type=filters.get("entity_type", "AUTO"),
             entity_identifier=ident,
+            organization=organization,
         )
         headers = [
             "Timestamp",

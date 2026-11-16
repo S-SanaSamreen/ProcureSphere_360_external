@@ -1,7 +1,7 @@
 from decimal import Decimal
 
 from django.core.exceptions import ValidationError
-from rest_framework import serializers, status, viewsets
+from rest_framework import filters, serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import SAFE_METHODS, BasePermission, IsAuthenticated
 from rest_framework.response import Response
@@ -31,6 +31,9 @@ class CanManageGoodsReceipt(BasePermission):
             or getattr(request.user, "role_code", None) == Role.VENDOR_USER
         )
         if is_vendor:
+            # Vendors can list their own PO receipts (GRN-010) but cannot inspect internal GRN detail (GRN-036)
+            if getattr(view, "action", None) == "retrieve":
+                return False
             return request.method in SAFE_METHODS
 
         if getattr(request.user, "role_code", None) == Role.REQUESTER:
@@ -58,25 +61,54 @@ class GoodsReceiptSerializer(serializers.ModelSerializer):
     received_by = serializers.PrimaryKeyRelatedField(
         queryset=User.objects.all(), default=serializers.CurrentUserDefault()
     )
+    grn_number = serializers.CharField(required=False, allow_blank=True)
+    received_date = serializers.DateTimeField(required=False)
 
     class Meta:
         model = GoodsReceipt
         fields = "__all__"
+        extra_kwargs = {
+            "grn_number": {"required": False},
+            "received_date": {"required": False},
+        }
 
     def validate(self, attrs):
-        po = attrs.get("po")
-        if po and po.status not in [
-            PurchaseOrder.STATUS_ISSUED,
-            PurchaseOrder.STATUS_ACKNOWLEDGED,
-            PurchaseOrder.STATUS_PARTIAL_RECEIPT,
-        ]:
-            raise serializers.ValidationError(
-                {
-                    "po": [
-                        f"Cannot record goods receipt against PO in status '{po.status}'. Must be ISSUED or ACKNOWLEDGED."
-                    ]
-                }
-            )
+        is_new_po = not self.instance or ("po" in attrs and attrs["po"] != self.instance.po)
+        if is_new_po:
+            po = attrs.get("po")
+            if po and po.status not in [
+                PurchaseOrder.STATUS_ISSUED,
+                PurchaseOrder.STATUS_ACKNOWLEDGED,
+                PurchaseOrder.STATUS_PARTIAL_RECEIPT,
+            ]:
+                raise serializers.ValidationError(
+                    {
+                        "po": [
+                            f"Cannot record goods receipt against PO in status '{po.status}'. Must be ISSUED or ACKNOWLEDGED."
+                        ]
+                    }
+                )
+
+        grn_num = attrs.get("grn_number") or self.initial_data.get("grn_number")
+        if grn_num and str(grn_num).strip():
+            clean_grn = str(grn_num).strip()
+            qs_grn = GoodsReceipt.objects.filter(grn_number__iexact=clean_grn)
+            if self.instance:
+                qs_grn = qs_grn.exclude(pk=self.instance.pk)
+            if qs_grn.exists():
+                raise serializers.ValidationError({"grn_number": ["Goods receipt with this GRN number already exists."]})
+
+        deliv_note = attrs.get("delivery_note_number") or self.initial_data.get("delivery_note_number")
+        po = attrs.get("po") or getattr(self.instance, "po", None)
+        if deliv_note and str(deliv_note).strip() and po:
+            clean_dn = str(deliv_note).strip()
+            qs_dn = GoodsReceipt.objects.filter(po=po, delivery_note_number__iexact=clean_dn)
+            if self.instance:
+                qs_dn = qs_dn.exclude(pk=self.instance.pk)
+            if qs_dn.exists():
+                raise serializers.ValidationError(
+                    {"delivery_note_number": [f"A goods receipt with delivery note '{clean_dn}' already exists for Purchase Order {po.po_number}."]}
+                )
 
         if self.instance is None:
             lines = self.initial_data.get("lines")
@@ -134,6 +166,26 @@ class GoodsReceiptSerializer(serializers.ModelSerializer):
                         raise serializers.ValidationError({"lines": [f"Quantity accepted cannot be negative for line {idx + 1}."]})
                     if qty_acc > qty_recv:
                         raise serializers.ValidationError({"lines": [f"Quantity accepted ({qty_acc}) cannot exceed quantity received ({qty_recv}) for line {idx + 1}."]})
+                else:
+                    qty_acc = qty_recv
+
+                raw_rej = item.get("quantity_rejected") or item.get("rejected")
+                if raw_rej is not None and str(raw_rej).strip() != "":
+                    try:
+                        qty_rej = Decimal(str(raw_rej))
+                    except (TypeError, ValueError, ArithmeticError, Exception):
+                        raise serializers.ValidationError({"lines": [f"Quantity rejected must be a valid numeric value for line {idx + 1}."]})
+                    if qty_rej < Decimal("0.00"):
+                        raise serializers.ValidationError({"lines": [f"Quantity rejected cannot be negative for line {idx + 1}."]})
+                else:
+                    qty_rej = qty_recv - qty_acc
+
+                if qty_acc + qty_rej > qty_recv:
+                    raise serializers.ValidationError({"lines": [f"Accepted quantity ({qty_acc}) plus rejected quantity ({qty_rej}) cannot exceed received quantity ({qty_recv}) for line {idx + 1}."]})
+
+                rej_reason = (item.get("rejection_reason") or item.get("reason") or item.get("notes") or "").strip()
+                if qty_rej > Decimal("0.00") and not rej_reason:
+                    raise serializers.ValidationError({"lines": [f"Rejection reason is required when rejected quantity is greater than 0 for line {idx + 1}."]})
 
         return attrs
 
@@ -146,6 +198,7 @@ class GoodsReceiptSerializer(serializers.ModelSerializer):
         received_by = validated_data.get("received_by") or (request.user if request else None)
         delivery_note = validated_data.get("delivery_note_number", "")
         remarks = validated_data.get("remarks", "")
+        grn_num = validated_data.get("grn_number") or self.initial_data.get("grn_number")
 
         try:
             return create_goods_receipt_service(
@@ -154,10 +207,18 @@ class GoodsReceiptSerializer(serializers.ModelSerializer):
                 receipt_items=lines_data,
                 delivery_note_number=delivery_note,
                 remarks=remarks,
+                grn_number=grn_num,
             )
         except ValidationError as e:
             msg = e.messages if hasattr(e, "messages") else [str(e)]
             raise serializers.ValidationError({"lines": msg})
+
+    def update(self, instance, validated_data):
+        if not validated_data.get("grn_number"):
+            validated_data["grn_number"] = instance.grn_number
+        if not validated_data.get("po"):
+            validated_data["po"] = instance.po
+        return super().update(instance, validated_data)
 
 
 class GoodsReceiptPermission(IsAuthenticated):
@@ -179,6 +240,11 @@ class GoodsReceiptPermission(IsAuthenticated):
         )
 
         if request.method in SAFE_METHODS:
+            if role_code == Role.VENDOR_USER:
+                # Vendors can list their own PO receipts (GRN-010) but cannot inspect internal GRN detail (GRN-036)
+                if getattr(view, "action", None) == "retrieve":
+                    return False
+                return True
             return role_code in [
                 Role.STORES_RECEIVER,
                 Role.SUPER_ADMIN,
@@ -186,7 +252,6 @@ class GoodsReceiptPermission(IsAuthenticated):
                 Role.PROC_EXEC,
                 Role.PROC_MGR,
                 Role.FINANCE_AP,
-                Role.VENDOR_USER,
             ]
 
         if role_code == Role.VENDOR_USER:
@@ -196,16 +261,23 @@ class GoodsReceiptPermission(IsAuthenticated):
 
 
 class GoodsReceiptViewSet(viewsets.ModelViewSet):
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ["grn_number", "delivery_note_number", "po__po_number", "remarks"]
+
     def destroy(self, request, *args, **kwargs):
-        return Response(
-            {
-                "error": {
-                    "code": "METHOD_NOT_ALLOWED",
-                    "message": "Posted goods receipts are immutable audit records and cannot be deleted. Use receipt corrections instead.",
-                }
-            },
-            status=status.HTTP_405_METHOD_NOT_ALLOWED,
-        )
+        instance = self.get_object()
+        if instance.overall_inspection_status != "PENDING" or getattr(instance, "stock_handoff_status", "") in ["COMPLETED", "HANDED_OFF", "PARTIALLY_HANDED_OFF"]:
+            return Response(
+                {
+                    "error": {
+                        "code": "VALIDATION_ERROR",
+                        "message": "Goods receipt cannot be deleted after inspection or hand-off.",
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        instance.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
     queryset = (
@@ -216,23 +288,51 @@ class GoodsReceiptViewSet(viewsets.ModelViewSet):
     serializer_class = GoodsReceiptSerializer
     permission_classes = [GoodsReceiptPermission]
 
-    def perform_destroy(self, instance):
-        if instance.status != GoodsReceipt.STATUS_DRAFT:
-            raise serializers.ValidationError(
-                {"status": [f"Goods receipt in '{instance.status}' status cannot be deleted."]}
-            )
-        instance.delete()
+    def create(self, request, *args, **kwargs):
+        from django.db import IntegrityError, transaction
+        try:
+            with transaction.atomic():
+                return super().create(request, *args, **kwargs)
+        except IntegrityError as exc:
+            err_msg = str(exc).lower()
+            if "grn_number" in err_msg or "receipts_goodsreceipt" in err_msg or "unique" in err_msg or "delivery_note_number" in err_msg:
+                return Response(
+                    {
+                        "error": {
+                            "code": "DUPLICATE_RESOURCE",
+                            "message": "A Goods Receipt with this GRN or Delivery Note already exists. Concurrent duplicate submission was blocked.",
+                            "details": {"grn_number": ["Goods receipt with this GRN number already exists."]},
+                        }
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+            raise
+
+
 
     def get_queryset(self):
         user = self.request.user
         qs = self.queryset
 
+        if not user or not user.is_authenticated:
+            return qs.none()
+
         # Vendor scoping: only receipts for vendor's own purchase orders
         if getattr(user, "is_vendor", False) or getattr(user, "vendor_id", None):
             if getattr(user, "vendor_id", None):
-                qs = qs.filter(po__vendor_id=user.vendor_id)
-            else:
-                return qs.none()
+                return qs.filter(po__vendor_id=user.vendor_id)
+            return qs.none()
+
+        # Multi-tenant organization scoping for internal users
+        if not user.is_superuser:
+            org = getattr(user, "effective_organization", None) or getattr(user, "organization", None)
+            if org:
+                from django.db.models import Q
+                qs = qs.filter(
+                    Q(po__cost_center__department__organization=org)
+                    | Q(po__requisition__department__organization=org)
+                    | Q(received_by__organization=org)
+                )
 
         po_id = self.request.query_params.get("po")
         if po_id:
@@ -304,6 +404,16 @@ class GoodsReceiptViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="handoff")
     def handoff(self, request, pk=None):
         receipt = self.get_object()
+        if receipt.overall_inspection_status != "PASSED":
+            return Response(
+                {
+                    "error": {
+                        "code": "VALIDATION_ERROR",
+                        "message": "Cannot hand off to stock: Quality inspection has not been completed on this receipt.",
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         storage_location = request.data.get("storage_location", "MAIN-WH")
         notes = request.data.get("handoff_notes", request.data.get("notes", ""))
         try:
@@ -336,6 +446,16 @@ class GoodsReceiptViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="confirm")
     def confirm(self, request, pk=None):
         receipt = self.get_object()
+        if receipt.overall_inspection_status != "PASSED":
+            return Response(
+                {
+                    "error": {
+                        "code": "VALIDATION_ERROR",
+                        "message": "Cannot confirm goods receipt: Quality inspection has not been completed.",
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         return Response(
             {
                 "message": f"Goods Receipt {receipt.grn_number} confirmed and posted.",

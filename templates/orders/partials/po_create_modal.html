@@ -33,7 +33,7 @@
             <select name="requisition_id" class="form-select">
                 <option value="">Select Approved PR...</option>
                 {% for pr in requisitions %}
-                    <option value="{{ pr.id }}">{{ pr.pr_number }} — {{ pr.title }} (${{ pr.total_amount|floatformat:2 }})</option>
+                    <option value="{{ pr.id }}">{{ pr.pr_number }} — {{ pr.title }} (₹{{ pr.total_amount|floatformat:2 }})</option>
                 {% endfor %}
             </select>
         </div>
@@ -52,7 +52,7 @@
                     <input type="number" name="quantity" class="form-control form-control-sm" value="1" min="1" step="0.01" required>
                 </div>
                 <div class="col-md-3">
-                    <label class="form-label text-muted small mb-1">Unit Price ($)</label>
+                    <label class="form-label text-muted small mb-1">Unit Price (₹)</label>
                     <input type="number" name="unit_price" class="form-control form-control-sm" placeholder="12500.00" min="0" step="0.01" required>
                 </div>
             </div>
