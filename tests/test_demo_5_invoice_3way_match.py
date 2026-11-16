@@ -17,6 +17,7 @@ from apps.orders.models import PurchaseOrder
 from apps.orders.services import acknowledge_purchase_order_service, generate_purchase_order_service
 from apps.organization.models import CostCenter, Department, FiscalPeriod, Organization
 from apps.receipts.services import create_goods_receipt_service
+from apps.requisitions.models import PurchaseRequisition
 from apps.requisitions.services import create_purchase_requisition_service
 from apps.vendors.models import Vendor, VendorCategory
 from apps.vendors.services import register_vendor_service
@@ -73,6 +74,10 @@ def test_demo_5_invoice_3way_match_and_exception_resolution():
     )
     vendor.status = Vendor.STATUS_ACTIVE
     vendor.save(update_fields=["status"])
+    vendor_role, _ = Role.objects.get_or_create(code=Role.VENDOR_USER, defaults={"name": "Vendor User"})
+    vendor_user = User.objects.create_user(
+        email="vendor.d5@apex.com", password="password123", role=vendor_role, vendor=vendor
+    )
 
     pr = create_purchase_requisition_service(
         title="Server Racks Purchase",
@@ -90,6 +95,8 @@ def test_demo_5_invoice_3way_match_and_exception_resolution():
         ],
     )
     check_and_reserve_budget_service(requisition=pr, requested_by_user=requester)
+    pr.status = PurchaseRequisition.STATUS_APPROVED
+    pr.save(update_fields=["status"])
 
     po = generate_purchase_order_service(
         vendor=vendor,
@@ -102,7 +109,7 @@ def test_demo_5_invoice_3way_match_and_exception_resolution():
     )
     po.status = PurchaseOrder.STATUS_ISSUED
     po.save(update_fields=["status"])
-    acknowledge_purchase_order_service(po=po, vendor_user=requester)
+    acknowledge_purchase_order_service(po=po, vendor_user=vendor_user)
     po_line = po.lines.first()
 
     # 3. Record Goods Receipt (10 units accepted)

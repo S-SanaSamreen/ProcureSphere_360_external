@@ -32,7 +32,7 @@ def _get_user_role_code(user):
 def create_contract_service(
     *,
     title: str,
-    vendor: Vendor,
+    vendor: Vendor = None,
     contract_value: Decimal,
     start_date,
     end_date,
@@ -40,10 +40,17 @@ def create_contract_service(
     renewal_notice_days: int = 30,
     sourcing_event=None,
     po=None,
+    contract_number: str = None,
 ) -> Contract:
     """
     Creates a new Contract in DRAFT status after strict validation of mandatory fields and term dates.
     """
+    if po and not vendor:
+        vendor = po.vendor
+
+    if not vendor:
+        raise ValidationError("Vendor is required to create a contract.")
+
     if vendor.status == Vendor.STATUS_SUSPENDED:
         raise ValidationError(
             f"Vendor '{vendor.legal_name}' is suspended and cannot enter into contracts."
@@ -51,36 +58,98 @@ def create_contract_service(
 
     if not title or not str(title).strip():
         raise ValidationError("Contract title is required.")
+
+    if isinstance(start_date, str):
+        from datetime import datetime
+
+        try:
+            start_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise ValidationError("Invalid start date format. Expected YYYY-MM-DD.")
+
+    if isinstance(end_date, str):
+        from datetime import datetime
+
+        try:
+            end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise ValidationError("Invalid end date format. Expected YYYY-MM-DD.")
+
     if end_date and start_date and end_date < start_date:
         raise ValidationError("Contract end date cannot be earlier than start date.")
-    if contract_value is not None:
-        try:
-            val = Decimal(str(contract_value))
-            if val < Decimal("0.00"):
-                raise ValidationError("Contract value cannot be negative.")
-        except (ValueError, TypeError, InvalidOperation):
-            raise ValidationError("Invalid contract value format.")
+    if contract_value is None:
+        raise ValidationError("Contract value is required.")
+    try:
+        val = Decimal(str(contract_value))
+        if val < Decimal("0.00"):
+            raise ValidationError("Contract value cannot be negative.")
+        contract_value = val
+    except (ValueError, TypeError, InvalidOperation):
+        raise ValidationError("Invalid contract value format.")
     if renewal_notice_days is not None and renewal_notice_days <= 0:
         raise ValidationError("Renewal notice period must be a positive number of days.")
 
-    from apps.core.services import generate_document_number
-
-    contract_number = generate_document_number(Contract, "contract_number", "CON")
-
-    contract = Contract.objects.create(
-        contract_number=contract_number,
-        title=title.strip(),
-        version=1,
+    # Prevent duplicate contracts with identical title, vendor, and term dates (DEF-018)
+    if Contract.objects.filter(
         vendor=vendor,
-        sourcing_event=sourcing_event,
-        po=po,
-        status=Contract.STATUS_DRAFT,
-        contract_value=contract_value,
+        title__iexact=title.strip(),
         start_date=start_date,
         end_date=end_date,
-        renewal_notice_days=renewal_notice_days,
-        contract_owner=contract_owner,
-    )
+    ).exists():
+        raise ValidationError(
+            f"A contract with title '{title.strip()}' for vendor '{vendor.legal_name}' with the same start and end dates already exists."
+        )
+
+    if contract_number:
+        contract_number = str(contract_number).strip()
+        if Contract.objects.filter(contract_number=contract_number).exists():
+            raise ValidationError(f"Contract with number '{contract_number}' already exists.")
+        contract = Contract.objects.create(
+            contract_number=contract_number,
+            title=title.strip(),
+            version=1,
+            vendor=vendor,
+            sourcing_event=sourcing_event,
+            po=po,
+            status=Contract.STATUS_DRAFT,
+            contract_value=contract_value,
+            start_date=start_date,
+            end_date=end_date,
+            renewal_notice_days=renewal_notice_days,
+            contract_owner=contract_owner,
+        )
+    else:
+        import random
+        import time
+
+        from django.db import IntegrityError
+
+        from apps.core.services import generate_document_number
+
+        contract = None
+        for attempt in range(15):
+            try:
+                with transaction.atomic():
+                    cand_number = generate_document_number(Contract, "contract_number", "CON", offset=attempt)
+                    contract = Contract.objects.create(
+                        contract_number=cand_number,
+                        title=title.strip(),
+                        version=1,
+                        vendor=vendor,
+                        sourcing_event=sourcing_event,
+                        po=po,
+                        status=Contract.STATUS_DRAFT,
+                        contract_value=contract_value,
+                        start_date=start_date,
+                        end_date=end_date,
+                        renewal_notice_days=renewal_notice_days,
+                        contract_owner=contract_owner,
+                    )
+                    break
+            except IntegrityError:
+                if attempt == 14:
+                    raise
+                time.sleep(random.uniform(0.01, 0.05))
 
     # Initial Version 1 Snapshot
     ContractVersion.objects.create(
@@ -256,6 +325,11 @@ def approve_business_service(*, contract: Contract, user: User, notes: str = "")
             f"Cannot perform business approval on contract in status '{contract.status}'. Mandatory legal review must be completed first."
         )
 
+    if contract.contract_owner_id and contract.contract_owner_id == user.id:
+        raise ValidationError(
+            "Separation of duties violation: Contract creator/owner cannot approve their own contract."
+        )
+
     previous_status = contract.status
     contract.status = Contract.STATUS_ACTIVE
     contract.save(update_fields=["status", "updated_at"])
@@ -317,17 +391,22 @@ def create_contract_version_service(
             "Permission Denied: Only Legal Managers, Procurement Managers, or Super Admins can amend contracts."
         )
 
+    if contract.status in [Contract.STATUS_DRAFT, Contract.STATUS_TERMINATED, Contract.STATUS_EXPIRED]:
+        raise ValidationError(f"Contracts in status '{contract.status}' cannot be amended. Only active/executed contracts can be amended.")
+
     if not amendment_summary or not str(amendment_summary).strip():
         raise ValidationError("Amendment summary is required.")
     if end_date and start_date and end_date < start_date:
         raise ValidationError("Contract end date cannot be earlier than start date.")
-    if contract_value is not None:
-        try:
-            val = Decimal(str(contract_value))
-            if val < Decimal("0.00"):
-                raise ValidationError("Contract value cannot be negative.")
-        except (ValueError, TypeError, InvalidOperation):
-            raise ValidationError("Invalid contract value format.")
+    if contract_value is None:
+        raise ValidationError("Contract value is required.")
+    try:
+        val = Decimal(str(contract_value))
+        if val < Decimal("0.00"):
+            raise ValidationError("Contract value cannot be negative.")
+        contract_value = val
+    except (ValueError, TypeError, InvalidOperation):
+        raise ValidationError("Invalid contract value format.")
 
     previous_version = contract.version
     previous_value = contract.contract_value
@@ -391,10 +470,24 @@ def add_contract_milestone_service(
     """
     Adds a tracked milestone to a contract with audit logging.
     """
+    if contract.status == Contract.STATUS_TERMINATED:
+        raise ValidationError("Cannot add milestones to a terminated contract.")
     if not title or not str(title).strip():
         raise ValidationError("Milestone title is required.")
     if not due_date:
         raise ValidationError("Milestone due date is required.")
+    import datetime
+    if isinstance(due_date, (datetime.date, datetime.datetime)):
+        d_val = due_date.date() if isinstance(due_date, datetime.datetime) else due_date
+    else:
+        try:
+            d_val = datetime.date.fromisoformat(str(due_date).strip()[:10])
+        except (ValueError, TypeError):
+            raise ValidationError(f"Invalid due date format '{due_date}'. Expected YYYY-MM-DD.")
+    if contract.start_date and d_val < contract.start_date:
+        raise ValidationError(f"Milestone due date ({d_val}) cannot be earlier than contract start date ({contract.start_date}).")
+    if contract.end_date and d_val > contract.end_date:
+        raise ValidationError(f"Milestone due date ({d_val}) cannot be later than contract end date ({contract.end_date}).")
     if amount is not None and Decimal(str(amount)) < Decimal("0.00"):
         raise ValidationError("Milestone amount cannot be negative.")
 
@@ -455,12 +548,17 @@ def add_contract_obligation_service(
     """
     Adds a legal obligation to a contract with audit logging.
     """
+    if contract.status == Contract.STATUS_TERMINATED:
+        raise ValidationError("Cannot add obligations to a terminated contract.")
     if not title or not str(title).strip():
         raise ValidationError("Obligation title is required.")
     if not due_date:
         raise ValidationError("Obligation due date is required.")
     if not responsible_party or not str(responsible_party).strip():
         raise ValidationError("Responsible party is required.")
+    valid_parties = ["VENDOR", "BUYER", "INTERNAL", "LEGAL", "PROCUREMENT", "MUTUAL", "BOTH"]
+    if responsible_party.strip().upper() not in valid_parties:
+        raise ValidationError(f"Invalid responsible_party '{responsible_party}'. Allowed values: {', '.join(valid_parties)}.")
 
     obligation = ContractObligation.objects.create(
         contract=contract,
@@ -532,9 +630,10 @@ def upload_contract_document_service(
     if not file:
         raise ValidationError("Document file is required.")
 
+    allowed_extensions = ["pdf", "docx", "doc", "xlsx", "xls", "png", "jpg", "jpeg", "txt"]
     if hasattr(file, "read") or hasattr(file, "size"):
         from apps.core.validators import validate_file_upload
-        validate_file_upload(file)
+        validate_file_upload(file, allowed_extensions=allowed_extensions)
 
     file_name = ""
     if hasattr(file, "name"):
@@ -545,9 +644,8 @@ def upload_contract_document_service(
     if not file_name or "." not in file_name or file_name.startswith("."):
         raise ValidationError("File must have a valid extension.")
 
-    clean_name = file_name.split()[0]
-    ext = clean_name.split(".")[-1].lower().rstrip(")")
-    allowed_extensions = ["pdf", "docx", "doc", "xlsx", "xls", "png", "jpg", "jpeg", "txt"]
+    import os
+    ext = os.path.splitext(file_name)[1].lstrip(".").lower()
     if ext not in allowed_extensions:
         raise ValidationError(
             f"Unsupported file extension '.{ext}'. Allowed formats: PDF, DOCX, XLSX, PNG, JPG, TXT."
@@ -681,6 +779,15 @@ def terminate_contract_service(*, contract: Contract, user: User, reason: str) -
         raise ValidationError("Termination reason is required.")
     if contract.status == Contract.STATUS_TERMINATED:
         raise ValidationError("Contract is already terminated.")
+    if contract.status not in (
+        Contract.STATUS_ACTIVE,
+        Contract.STATUS_RENEWAL_DUE,
+        Contract.STATUS_RENEWED,
+    ):
+        raise ValidationError(
+            f"Cannot terminate contract in status '{contract.status}'. "
+            "Only active or renewal-due contracts can be terminated."
+        )
 
     previous_status = contract.status
     contract.status = Contract.STATUS_TERMINATED

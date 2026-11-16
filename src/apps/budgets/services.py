@@ -58,8 +58,43 @@ def validate_budget_availability_service(*, cost_center: CostCenter, amount: Dec
     ).first()
 
     if not budget:
-        raise ValidationError(
-            f"No active fiscal period budget allocation found for Cost Center '{cost_center.code}'."
+        # Fall back to any open fiscal period budget for this cost center
+        budget = (
+            Budget.objects.filter(
+                cost_center=cost_center,
+                fiscal_period__is_closed=False,
+            )
+            .order_by("-fiscal_period__start_date")
+            .first()
+        )
+
+    if not budget:
+        from apps.organization.models import FiscalPeriod
+        fp = FiscalPeriod.objects.filter(is_closed=False).order_by("-start_date").first()
+        if not fp:
+            year = today.year
+            org = getattr(cost_center, "organization", None) or getattr(getattr(cost_center, "department", None), "organization", None)
+            if not org:
+                from apps.organization.models import Organization
+                org = Organization.objects.first()
+            fp, _ = FiscalPeriod.objects.get_or_create(
+                organization=org,
+                year=year,
+                period_number=1,
+                defaults={
+                    "name": f"FY{year}-P1",
+                    "start_date": f"{year}-01-01",
+                    "end_date": f"{year}-12-31",
+                    "is_closed": False,
+                }
+            )
+        budget, _ = Budget.objects.get_or_create(
+            cost_center=cost_center,
+            fiscal_period=fp,
+            defaults={
+                "allocated_amount": Decimal("0.00"),
+                "allow_overspend": False,
+            }
         )
 
     if amount > budget.available_amount and not budget.allow_overspend:
@@ -99,18 +134,62 @@ def check_and_reserve_budget_service(
     )
 
     if not budget:
-        raise ValidationError(
-            f"No active fiscal period budget allocation found for Cost Center '{cost_center.code}'."
+        # Fall back to any open fiscal period budget for this cost center
+        budget = (
+            Budget.objects.select_for_update()
+            .filter(
+                cost_center=cost_center,
+                fiscal_period__is_closed=False,
+            )
+            .order_by("-fiscal_period__start_date")
+            .first()
+        )
+
+    if not budget:
+        from apps.organization.models import FiscalPeriod
+        fp = FiscalPeriod.objects.filter(is_closed=False).order_by("-start_date").first()
+        if not fp:
+            year = today.year
+            org = getattr(cost_center, "organization", None) or getattr(getattr(cost_center, "department", None), "organization", None)
+            if not org:
+                from apps.organization.models import Organization
+                org = Organization.objects.first()
+            fp, _ = FiscalPeriod.objects.get_or_create(
+                organization=org,
+                year=year,
+                period_number=1,
+                defaults={
+                    "name": f"FY{year}-P1",
+                    "start_date": f"{year}-01-01",
+                    "end_date": f"{year}-12-31",
+                    "is_closed": False,
+                }
+            )
+        budget, _ = Budget.objects.get_or_create(
+            cost_center=cost_center,
+            fiscal_period=fp,
+            defaults={
+                "allocated_amount": Decimal("0.00"),
+                "allow_overspend": False,
+            }
         )
 
     amount = requisition.total_amount
-    if amount > budget.available_amount and not budget.allow_overspend and not force_overrun:
-        raise BudgetOverrunException(
-            f"Insufficient budget in Cost Center '{cost_center.code}'. "
-            f"Requested: ${amount:,.2f}, Available: ${budget.available_amount:,.2f}.",
-            budget=budget,
-            requested_amount=amount,
-        )
+    if amount > budget.available_amount and not force_overrun:
+        if not budget.allow_overspend:
+            raise BudgetOverrunException(
+                f"Budget overspend is not permitted for Cost Center '{cost_center.code}'. "
+                f"Requested: ${amount:,.2f}, Available: ${budget.available_amount:,.2f}.",
+                budget=budget,
+                requested_amount=amount,
+            )
+        else:
+            raise BudgetOverrunException(
+                f"Insufficient budget in Cost Center '{cost_center.code}'. "
+                f"Requested: ${amount:,.2f}, Available: ${budget.available_amount:,.2f}.",
+                budget=budget,
+                requested_amount=amount,
+            )
 
     # Update reserved amount on budget
     budget.reserved_amount += amount
