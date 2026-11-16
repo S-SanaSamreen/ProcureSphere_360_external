@@ -1,6 +1,7 @@
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import PermissionDenied, ValidationError
+from django.core.paginator import Paginator
 from django.db.models import Q
 from django.http import Http404
 from django.shortcuts import get_object_or_404, redirect, render
@@ -50,8 +51,17 @@ def list_view(request):
             .order_by("-created_at")
         )
 
+    paginator = Paginator(items, 10)
+    page_obj = paginator.get_page(request.GET.get("page"))
+    query_params = request.GET.copy()
+    query_params.pop("page", None)
+    querystring = query_params.urlencode()
+
     context = {
-        "items": items,
+        "items": page_obj,
+        "page_obj": page_obj,
+        "paginator": paginator,
+        "querystring": querystring,
         "role_code": role_code,
         "is_stores_receiver": role_code == Role.STORES_RECEIVER,
         "receivable_statuses": RECEIVABLE_PO_STATUSES,
@@ -60,8 +70,8 @@ def list_view(request):
     }
     if role_code in [Role.PROC_MGR, "PROC_MGR"]:
         context["base_layout"] = "manager/base_manager.html"
-    elif role_code == Role.SUPER_ADMIN or getattr(user, "is_superuser", False):
-        context["base_layout"] = "base.html"
+    elif role_code in (Role.SUPER_ADMIN, "SUPER_ADMIN") or getattr(user, "is_superuser", False):
+        context["base_layout"] = "layouts/superadmin_base.html"
 
     return render(
         request,
@@ -145,7 +155,10 @@ def detail_view(request, pk):
                 "PROC_MGR": "manager/base_manager.html",
                 "AUDITOR": "audit/base_auditor.html",
                 "SUPER_ADMIN": "layouts/superadmin_base.html",
-            }.get(role_code, "base.html"),
+            }.get(
+                role_code,
+                "layouts/superadmin_base.html" if getattr(user, "is_superuser", False) else "base.html",
+            ),
         },
     )
 

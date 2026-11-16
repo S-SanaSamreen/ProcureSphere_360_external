@@ -96,12 +96,9 @@ def receipts_list_view(request):
         )
         return redirect("vendor_dashboard")
 
-    if role_code in (Role.REQUESTER, "REQUESTER"):
-        messages.info(
-            request,
-            "Goods receipt operations are managed by Stores. Requesters can track receipts from their requisitions.",
-        )
-        return redirect("requisitions_list")
+    if not request.user.is_superuser and role_code in [Role.REQUESTER, Role.DEPT_APPROVER, Role.LEGAL_MGR]:
+        from django.core.exceptions import PermissionDenied
+        raise PermissionDenied("Access to goods receipts is denied for your role.")
 
     search_query = request.GET.get("q", "").strip()
     status_filter = request.GET.get("status", "").strip().upper()
@@ -985,7 +982,7 @@ def receipt_line_correct_view(request, line_id):
             request,
             "Permission Denied: Only Stores Receiver or Super Admin can correct receipt quantities.",
         )
-        return redirect("receipts_list")
+        return redirect("receipts_rejections_queue")
 
     line = get_object_or_404(
         ReceiptLine.objects.select_related("receipt__po", "po_line"),
@@ -1381,11 +1378,20 @@ def receipt_delivery_performance_report_view(request):
             )
             return response
 
+    paginator = Paginator(report_lines, 10)
+    page_obj = paginator.get_page(request.GET.get("page"))
+    query_params = request.GET.copy()
+    query_params.pop("page", None)
+    querystring = query_params.urlencode()
+
     return render(
         request,
         "receipts/delivery_performance_report.html",
         {
-            "report_lines": report_lines,
+            "report_lines": page_obj,
+            "page_obj": page_obj,
+            "paginator": paginator,
+            "querystring": querystring,
             "summary": summary,
             "filters": {
                 "start_date": start_date or "",

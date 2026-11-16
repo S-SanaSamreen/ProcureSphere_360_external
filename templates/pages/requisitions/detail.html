@@ -18,8 +18,8 @@
             <i class="fa-solid fa-arrow-left me-1"></i> Back to Budget Exceptions
         </a>
         {% elif role_code == 'DEPT_APPROVER' or role_code == 'PROC_EXEC' %}
-        <a href="/approvals/inbox/" class="text-decoration-none text-muted mb-2 d-inline-block">
-            <i class="fa-solid fa-arrow-left me-1"></i> Back to Approvals Inbox
+        <a href="javascript:if(window.history.length>1){window.history.back();}else{window.location.href='/approvals/inbox/';}" class="btn btn-sm btn-outline-secondary rounded-pill px-3 py-1 text-decoration-none mb-2 d-inline-flex align-items-center">
+            <i class="fa-solid fa-arrow-left me-1"></i> Back
         </a>
         {% elif role_code == 'SUPER_ADMIN' or role_code == 'ADMIN' or request.user.is_superuser %}
         <div class="d-flex align-items-center gap-2 mb-2">
@@ -61,32 +61,44 @@
 
         {% if can_approve %}
             {% if pr.status == 'SUBMITTED' or pr.status == 'MANAGER_REVIEW' %}
-            <form method="POST" action="{% url 'requisition_approve' pr.pk %}" class="d-inline-flex gap-2 flex-grow-1 flex-md-grow-0">
+            <form method="POST" action="{% url 'requisition_approve' pr.pk %}" class="d-inline-flex gap-2 flex-grow-1 flex-md-grow-0" onsubmit="this.querySelector('input[name=comments]').value = (document.getElementById('decisionCommentsSidebar')?.value || '').trim()">
                 {% csrf_token %}
+                <input type="hidden" name="comments" value="">
                 <button type="submit" class="btn btn-success rounded-pill shadow-sm px-4 fw-bold w-100">
                     <i class="fa-solid fa-check me-2"></i>Approve PR
                 </button>
             </form>
-            <form method="POST" action="{% url 'requisition_reject' pr.pk %}" class="d-inline-flex gap-2 flex-grow-1 flex-md-grow-0">
+            <form method="POST" action="{% url 'requisition_reject' pr.pk %}" class="d-inline-flex gap-2 flex-grow-1 flex-md-grow-0" onsubmit="this.querySelector('input[name=comments]').value = (document.getElementById('decisionCommentsSidebar')?.value || 'Rejected').trim()">
                 {% csrf_token %}
+                <input type="hidden" name="comments" value="Rejected">
                 <button type="submit" class="btn btn-outline-danger rounded-pill shadow-sm px-4 fw-bold w-100">
                     <i class="fa-solid fa-times me-2"></i>Reject PR
                 </button>
             </form>
             {% elif pr.status == 'BUDGET_REVIEW' %}
-            <form method="POST" action="{% url 'requisition_approve' pr.pk %}" class="d-inline-flex gap-2 flex-grow-1 flex-md-grow-0">
+            <form method="POST" action="{% url 'requisition_approve' pr.pk %}" class="d-inline-flex gap-2 flex-grow-1 flex-md-grow-0" onsubmit="this.querySelector('input[name=comments]').value = (document.getElementById('decisionCommentsSidebarBudget')?.value || '').trim()">
                 {% csrf_token %}
+                <input type="hidden" name="comments" value="">
                 <button type="submit" class="btn btn-warning rounded-pill shadow-sm px-4 fw-bold text-dark w-100">
                     <i class="fa-solid fa-check-double me-2"></i>Approve Budget Exception
                 </button>
             </form>
-            <form method="POST" action="{% url 'requisition_reject' pr.pk %}" class="d-inline-flex gap-2 flex-grow-1 flex-md-grow-0">
+            <form method="POST" action="{% url 'requisition_reject' pr.pk %}" class="d-inline-flex gap-2 flex-grow-1 flex-md-grow-0" onsubmit="this.querySelector('input[name=comments]').value = (document.getElementById('decisionCommentsSidebarBudget')?.value || 'Budget Rejected').trim()">
                 {% csrf_token %}
+                <input type="hidden" name="comments" value="Budget Rejected">
                 <button type="submit" class="btn btn-outline-danger rounded-pill shadow-sm px-4 fw-bold w-100">
                     <i class="fa-solid fa-times me-2"></i>Reject Exception
                 </button>
             </form>
             {% endif %}
+        {% elif can_reject %}
+            <form method="POST" action="{% url 'requisition_reject' pr.pk %}" class="d-inline-flex gap-2 flex-grow-1 flex-md-grow-0" onsubmit="this.querySelector('input[name=comments]').value = (document.getElementById('decisionCommentsSidebar')?.value || 'Budget Overrun Rejected').trim()">
+                {% csrf_token %}
+                <input type="hidden" name="comments" value="Budget Overrun Rejected">
+                <button type="submit" class="btn btn-outline-danger rounded-pill shadow-sm px-4 fw-bold w-100">
+                    <i class="fa-solid fa-times me-2"></i>Reject Out-of-Budget PR
+                </button>
+            </form>
         {% elif user_has_approved and pr.status in 'SUBMITTED,MANAGER_REVIEW' %}
             <div class="d-inline-flex align-items-center bg-success bg-opacity-10 border border-success border-opacity-25 rounded-pill px-3 py-1">
                 <i class="fa-solid fa-circle-check text-success me-2"></i>
@@ -123,9 +135,9 @@
             <span class="badge bg-danger rounded-pill px-2.5 py-1 text-wrap">Budget Overrun</span>
         </div>
         <p class="mb-2 text-dark small" style="line-height: 1.45;">
-            This requisition's total amount of <strong>${{ pr.total_amount|floatformat:2 }}</strong> exceeds the
+            This requisition's total amount of <strong>₹{{ pr.total_amount|floatformat:2 }}</strong> exceeds the
             available budget
-            {% if role_code != 'REQUESTER' and available_budget != None %}(<strong>${{ available_budget|floatformat:2 }}</strong> remaining){% endif %}
+            {% if role_code != 'REQUESTER' and available_budget != None %}(<strong>₹{{ available_budget|floatformat:2 }}</strong> remaining){% endif %}
             for Cost Center <strong>{{ pr.cost_center.code }} - {{ pr.cost_center.name }}</strong>.
         </p>
         <div class="small text-muted">
@@ -328,8 +340,8 @@
                                 <td class="fw-semibold">{{ line.item_description }}</td>
                                 <td>{{ line.quantity|floatformat:2 }}</td>
                                 <td>{{ line.unit_of_measure }}</td>
-                                <td class="text-end">${{ line.estimated_unit_price|floatformat:2 }}</td>
-                                <td class="text-end fw-bold">${{ line.estimated_total|floatformat:2 }}</td>
+                                <td class="text-end">₹{{ line.estimated_unit_price|floatformat:2 }}</td>
+                                <td class="text-end fw-bold">₹{{ line.estimated_total|floatformat:2 }}</td>
                             </tr>
                             {% empty %}
                             <tr>
@@ -340,7 +352,7 @@
                         <tfoot class="table-light">
                             <tr>
                                 <td colspan="4" class="text-end fw-bold">Total Estimated Amount:</td>
-                                <td class="text-end fw-bold text-primary fs-5">${{ pr.total_amount|floatformat:2 }}</td>
+                                <td class="text-end fw-bold text-primary fs-5">₹{{ pr.total_amount|floatformat:2 }}</td>
                             </tr>
                         </tfoot>
                     </table>
@@ -402,11 +414,17 @@
                             </div>
                         </div>
                         <div class="d-flex align-items-center gap-2 flex-shrink-0 w-100 w-sm-auto justify-content-end">
-                            <a href="{% url 'requisition_attachment_download' pr.pk attachment.pk %}?action=view" target="_blank"
+                            <button type="button"
                                 class="btn btn-sm btn-outline-secondary rounded-pill px-3 flex-fill flex-sm-grow-0 text-center"
-                                title="View {{ attachment.title }}">
+                                title="View {{ attachment.title }}"
+                                data-doc-title="{{ attachment.title }}"
+                                data-doc-size="{{ attachment.file_size|filesizeformat }}"
+                                data-doc-date="{{ attachment.created_at|date:'M d, Y H:i' }}"
+                                data-doc-view-url="{% url 'requisition_attachment_download' pr.pk attachment.pk %}?action=view"
+                                data-doc-download-url="{% url 'requisition_attachment_download' pr.pk attachment.pk %}?action=download"
+                                onclick="openPrDocPreview(this)">
                                 <i class="fa-solid fa-eye me-1"></i>View
-                            </a>
+                            </button>
                             <a href="{% url 'requisition_attachment_download' pr.pk attachment.pk %}?action=download"
                                 class="btn btn-sm btn-primary rounded-pill px-3 shadow-sm text-white flex-fill flex-sm-grow-0 text-center"
                                 title="Download {{ attachment.title }}">
@@ -549,11 +567,11 @@
                         Available Budget Remaining
                     </div>
                     <div class="fs-4 fw-bold {% if is_budget_exceeded %}text-danger{% else %}text-success{% endif %} mt-1">
-                        ${{ available_budget|floatformat:2 }}
+                        ₹{{ available_budget|floatformat:2 }}
                     </div>
                     {% if is_budget_exceeded %}
                     <div class="small text-danger fw-semibold mt-1">
-                        <i class="fa-solid fa-triangle-exclamation me-1"></i> Budget Exceeded by ${{ pr.total_amount|floatformat:2 }}
+                        <i class="fa-solid fa-triangle-exclamation me-1"></i> Budget Exceeded by ₹{{ pr.total_amount|floatformat:2 }}
                     </div>
                     {% else %}
                     <div class="small text-muted">Cost Center funds available for new PRs</div>
@@ -581,7 +599,7 @@
                     </div>
                     <div class="fw-bold font-monospace fs-6 mb-1">{{ latest_po.po_number }}</div>
                     <div class="small text-muted mb-1">Vendor: <span class="fw-semibold text-dark">{{ latest_po.vendor.legal_name }}</span></div>
-                    <div class="small text-muted mb-3">Amount: <span class="fw-bold text-dark">${{ latest_po.total_amount|floatformat:2 }}</span></div>
+                    <div class="small text-muted mb-3">Amount: <span class="fw-bold text-dark">₹{{ latest_po.total_amount|floatformat:2 }}</span></div>
                     <a href="{% url 'order_detail' latest_po.id %}" class="btn btn-sm btn-outline-primary rounded-pill px-3 w-100 fw-semibold">
                         <i class="fa-solid fa-arrow-up-right-from-square me-1"></i> View Purchase Order
                     </a>
@@ -607,73 +625,60 @@
         <!-- Approval Action Decision Card -->
         {% if can_approve %}
             {% if pr.status == 'SUBMITTED' or pr.status == 'MANAGER_REVIEW' %}
-            <div class="card border-primary border-2 shadow-sm rounded-4 mb-4 bg-primary bg-opacity-10">
+            <div id="approvalActionDecision" class="card border-primary border-2 shadow-sm rounded-4 mb-4 bg-primary bg-opacity-10">
                 <div class="card-body p-4">
                     <h6 class="fw-bold text-dark mb-2">
                         <i class="fa-solid fa-stamp text-primary me-2"></i>Approval Action Decision
                     </h6>
-                    <p class="small text-muted mb-3">Review business justification and budget impact, then record your
-                        decision.</p>
+                    <p class="small text-muted mb-3">Review business justification and budget impact, then enter any decision remarks or notes below.</p>
 
-                    <div class="d-grid gap-2">
-                        <form method="POST" action="{% url 'requisition_approve' pr.pk %}">
-                            {% csrf_token %}
-                            <div class="mb-3">
-                                <label class="form-label small fw-semibold text-dark">Decision Comments</label>
-                                <textarea name="comments" class="form-control form-control-sm" rows="2"
-                                    placeholder="Optional comments or notes..."></textarea>
-                            </div>
-                            <button type="submit" class="btn btn-success fw-bold shadow-sm rounded-pill py-2 w-100">
-                                <i class="fa-solid fa-check me-2"></i> Approve Requisition
-                            </button>
-                        </form>
-                        <form method="POST" action="{% url 'requisition_reject' pr.pk %}">
-                            {% csrf_token %}
-                            <input type="hidden" name="comments" value="Rejected via dashboard"
-                                class="reject-comments-mirror">
-                            <button type="submit" class="btn btn-outline-danger fw-bold rounded-pill py-2 w-100 mt-2"
-                                onclick="document.querySelector('.reject-comments-mirror').value = this.closest('.d-grid').querySelector('textarea[name=comments]').value || 'Rejected'">
-                                <i class="fa-solid fa-xmark me-2"></i> Reject Requisition
-                            </button>
-                        </form>
+                    <div class="mb-0">
+                        <label for="decisionCommentsSidebar" class="form-label small fw-semibold text-dark">Decision Comments</label>
+                        <textarea id="decisionCommentsSidebar" name="comments" class="form-control form-control-sm bg-white" rows="3"
+                            placeholder="Add approval or rejection comments..."></textarea>
+                        <div class="form-text small text-muted mt-1">
+                            <i class="fa-solid fa-info-circle me-1"></i>Remarks will be recorded when you click Approve PR or Reject PR at the top.
+                        </div>
                     </div>
                 </div>
             </div>
             {% elif pr.status == 'BUDGET_REVIEW' %}
-            <div class="card border-warning border-2 shadow-sm rounded-4 mb-4 bg-warning bg-opacity-10">
+            <div id="approvalActionDecision" class="card border-warning border-2 shadow-sm rounded-4 mb-4 bg-warning bg-opacity-10">
                 <div class="card-body p-4">
                     <h6 class="fw-bold text-dark mb-2">
                         <i class="fa-solid fa-triangle-exclamation text-warning me-2"></i>Budget Exception Review
                     </h6>
-                    <p class="small text-muted mb-3">This PR exceeds the available budget limit for its Cost Center. As a
-                        Finance user, you must review and explicitly approve this overspend.</p>
+                    <p class="small text-muted mb-3">This PR exceeds the available budget limit for its Cost Center. Enter required justification below.</p>
 
-                    <div class="d-grid gap-2">
-                        <form method="POST" action="{% url 'requisition_approve' pr.pk %}">
-                            {% csrf_token %}
-                            <div class="mb-3">
-                                <label class="form-label small fw-semibold text-dark">Exception Comments</label>
-                                <textarea name="comments" class="form-control form-control-sm" rows="2"
-                                    placeholder="Required justification for budget overrun..."></textarea>
-                            </div>
-                            <button type="submit"
-                                class="btn btn-warning text-dark fw-bold shadow-sm rounded-pill py-2 w-100">
-                                <i class="fa-solid fa-check-double me-2"></i> Approve Budget Exception
-                            </button>
-                        </form>
-                        <form method="POST" action="{% url 'requisition_reject' pr.pk %}">
-                            {% csrf_token %}
-                            <input type="hidden" name="comments" value="Rejected via dashboard"
-                                class="reject-comments-mirror-2">
-                            <button type="submit" class="btn btn-outline-danger fw-bold rounded-pill py-2 w-100 mt-2"
-                                onclick="document.querySelector('.reject-comments-mirror-2').value = this.closest('.d-grid').querySelector('textarea[name=comments]').value || 'Budget Rejected'">
-                                <i class="fa-solid fa-xmark me-2"></i> Reject Exception
-                            </button>
-                        </form>
+                    <div class="mb-0">
+                        <label for="decisionCommentsSidebarBudget" class="form-label small fw-semibold text-dark">Exception Comments</label>
+                        <textarea id="decisionCommentsSidebarBudget" name="comments" class="form-control form-control-sm bg-white" rows="3"
+                            placeholder="Required justification for budget overrun..."></textarea>
+                        <div class="form-text small text-muted mt-1">
+                            <i class="fa-solid fa-info-circle me-1"></i>Remarks will be recorded when you click Approve Budget Exception or Reject Exception at the top.
+                        </div>
                     </div>
                 </div>
             </div>
             {% endif %}
+        {% elif can_reject %}
+            <div id="approvalActionDecision" class="card border-danger border-2 shadow-sm rounded-4 mb-4 bg-danger bg-opacity-10">
+                <div class="card-body p-4">
+                    <h6 class="fw-bold text-dark mb-2">
+                        <i class="fa-solid fa-ban text-danger me-2"></i>Budget Governance Rejection
+                    </h6>
+                    <p class="small text-muted mb-3">This purchase requisition exceeds available cost center budget limits. As Procurement Manager, you may inspect the transaction and reject the request.</p>
+
+                    <div class="mb-0">
+                        <label for="decisionCommentsSidebar" class="form-label small fw-semibold text-dark">Rejection Justification (Mandatory)</label>
+                        <textarea id="decisionCommentsSidebar" name="comments" class="form-control form-control-sm bg-white" rows="3"
+                            placeholder="Provide reason for rejecting this out-of-budget PR..."></textarea>
+                        <div class="form-text small text-muted mt-1">
+                            <i class="fa-solid fa-info-circle me-1"></i>Remarks will be recorded in the audit trail when you click Reject Out-of-Budget PR above.
+                        </div>
+                    </div>
+                </div>
+            </div>
         {% elif user_has_approved and pr.status in 'SUBMITTED,MANAGER_REVIEW' %}
             <div class="card border-success border-opacity-25 shadow-sm rounded-4 mb-4 bg-success bg-opacity-10">
                 <div class="card-body p-4 text-center">
@@ -735,7 +740,7 @@
                         <span class="badge bg-secondary">{{ po.get_status_display }}</span>
                     </div>
                     <div class="small text-muted mb-1">Vendor: <span class="fw-semibold text-dark">{{ po.vendor.legal_name }}</span></div>
-                    <div class="small text-muted">Amount: <span class="fw-semibold text-dark">${{ po.total_amount }}</span></div>
+                    <div class="small text-muted">Amount: <span class="fw-semibold text-dark">₹{{ po.total_amount }}</span></div>
                 </div>
                 {% endfor %}
             </div>
@@ -854,4 +859,57 @@
         </div>
     </div>
 </div>
+<!-- In-App Supporting Document Preview Modal (BUG-009) -->
+<div class="modal fade" id="prDocumentPreviewModal" tabindex="-1" aria-labelledby="prDocPreviewTitle" aria-hidden="true">
+    <div class="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable">
+        <div class="modal-content border-0 shadow-lg rounded-4 overflow-hidden">
+            <div class="modal-header bg-light border-bottom px-4 py-3">
+                <div class="min-width-0">
+                    <h5 class="modal-title fw-bold text-dark text-truncate mb-0" id="prDocPreviewTitle">Document Preview</h5>
+                    <div class="text-muted small" id="prDocPreviewMeta"></div>
+                </div>
+                <div class="d-flex align-items-center gap-2 ms-auto">
+                    <a id="prDocDownloadBtn" href="#" class="btn btn-sm btn-primary rounded-pill px-3">
+                        <i class="fa-solid fa-download me-1"></i>Download
+                    </a>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+            </div>
+            <div class="modal-body p-0 bg-body-tertiary" id="prDocPreviewBody" style="min-height: 420px;"></div>
+        </div>
+    </div>
+</div>
+<script>
+function openPrDocPreview(btn) {
+    const title = btn.getAttribute("data-doc-title") || "Document";
+    const size = btn.getAttribute("data-doc-size") || "";
+    const uploaded = btn.getAttribute("data-doc-date") || "";
+    const viewUrl = btn.getAttribute("data-doc-view-url") || "#";
+    const downloadUrl = btn.getAttribute("data-doc-download-url") || viewUrl;
+
+    document.getElementById("prDocPreviewTitle").textContent = title;
+    document.getElementById("prDocPreviewMeta").textContent = [size, uploaded ? ("Uploaded " + uploaded) : ""].filter(Boolean).join(" • ");
+    document.getElementById("prDocDownloadBtn").setAttribute("href", downloadUrl);
+
+    const bodyEl = document.getElementById("prDocPreviewBody");
+    const ext = title.split(".").pop().toLowerCase();
+    if (["png", "jpg", "jpeg", "gif", "webp"].includes(ext)) {
+        bodyEl.innerHTML = `<div class="p-4 text-center"><img src="${viewUrl}" alt="" class="img-fluid rounded shadow-sm" style="max-height: 70vh;"></div>`;
+    } else if (["pdf", "txt", "csv"].includes(ext)) {
+        bodyEl.innerHTML = `<iframe src="${viewUrl}" title="${title}" class="w-100 border-0" style="height: 72vh;"></iframe>`;
+    } else {
+        bodyEl.innerHTML = `
+            <div class="p-5 text-center">
+                <div class="rounded-circle bg-primary bg-opacity-10 text-primary d-inline-flex align-items-center justify-content-center mb-3" style="width: 64px; height: 64px;">
+                    <i class="fa-solid fa-file-lines fs-2"></i>
+                </div>
+                <h6 class="fw-bold text-dark mb-1">${title}</h6>
+                <p class="text-muted small mb-3">Inline browser rendering is not supported for <code>.${ext}</code> files. Use the Download button above or below to open this document locally.</p>
+                <a href="${downloadUrl}" class="btn btn-primary btn-sm rounded-pill px-4"><i class="fa-solid fa-download me-1"></i>Download ${title}</a>
+            </div>
+        `;
+    }
+    new bootstrap.Modal(document.getElementById("prDocumentPreviewModal")).show();
+}
+</script>
 {% endblock %}
