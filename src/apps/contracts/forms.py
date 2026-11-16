@@ -12,16 +12,19 @@ class ContractCreateForm(forms.ModelForm):
         queryset=Vendor.objects.all(),
         widget=forms.Select(attrs={"class": "form-select"}),
         required=True,
+        empty_label="-- Select Vendor --",
     )
     sourcing_event = forms.ModelChoiceField(
         queryset=SourcingEvent.objects.all(),
         widget=forms.Select(attrs={"class": "form-select"}),
         required=False,
+        empty_label="-- Select Sourcing Event (Optional) --",
     )
     po = forms.ModelChoiceField(
         queryset=PurchaseOrder.objects.all(),
         widget=forms.Select(attrs={"class": "form-select"}),
         required=False,
+        empty_label="-- Select Purchase Order (Optional) --",
     )
 
     class Meta:
@@ -104,7 +107,20 @@ class ContractMilestoneForm(forms.ModelForm):
         }
 
 
+RESPONSIBLE_PARTY_CHOICES = [
+    ("LEGAL", "Legal Team (LEGAL)"),
+    ("VENDOR", "Vendor (VENDOR)"),
+    ("BUYER", "Buyer / Client (BUYER)"),
+    ("INTERNAL", "Internal Team (INTERNAL)"),
+    ("PROCUREMENT", "Procurement (PROCUREMENT)"),
+    ("MUTUAL", "Mutual Responsibility (MUTUAL)"),
+    ("BOTH", "Both Parties (BOTH)"),
+]
+
+
 class ContractObligationForm(forms.ModelForm):
+    RESPONSIBLE_PARTY_CHOICES = RESPONSIBLE_PARTY_CHOICES
+
     class Meta:
         model = ContractObligation
         fields = ["title", "responsible_party", "due_date"]
@@ -115,8 +131,9 @@ class ContractObligationForm(forms.ModelForm):
                     "placeholder": "e.g., Monthly SLA Uptime Report Submission",
                 }
             ),
-            "responsible_party": forms.TextInput(
-                attrs={"class": "form-control", "placeholder": "VENDOR / HPE LEGAL"}
+            "responsible_party": forms.Select(
+                choices=RESPONSIBLE_PARTY_CHOICES,
+                attrs={"class": "form-select"},
             ),
             "due_date": forms.DateInput(attrs={"class": "form-control", "type": "date"}),
         }

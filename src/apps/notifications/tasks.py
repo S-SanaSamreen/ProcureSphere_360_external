@@ -45,6 +45,9 @@ def send_user_welcome_email_task(self, user_id: str, temporary_password: str, lo
         logger.error("User with id %s does not exist for welcome email task", user_id)
         return "FAILED"
     except Exception as exc:
+        from celery.exceptions import Retry
+        if isinstance(exc, Retry):
+            raise
         logger.error("Unexpected error in send_user_welcome_email_task: %s", exc)
         raise self.retry(exc=exc)
 
@@ -60,4 +63,10 @@ def scan_overdue_approvals_and_escalate():
     result = scan_overdue_approvals_and_escalate_service()
     logger.info("Scan overdue approvals completed: %s", result)
     return result
+
+
+@shared_task(name="apps.notifications.tasks.scan_overdue_approvals_and_escalate")
+def scan_overdue_approvals_and_escalate_alias():
+    """Alias for Celery Beat schedule compatibility."""
+    return scan_overdue_approvals_and_escalate()
 

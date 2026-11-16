@@ -16,12 +16,13 @@ def scope_budgets_queryset(qs, user):
         qs = Budget.objects.select_related("cost_center", "fiscal_period").order_by("-created_at")
     if not user or not user.is_authenticated:
         return qs.none()
-    if user.is_superuser:
-        return qs
 
     role_code = getattr(user, "role_code", None) or (
         user.role.code if hasattr(user, "role") and user.role else None
     )
+
+    if user.is_superuser or role_code == Role.SUPER_ADMIN:
+        return qs
 
     if getattr(user, "is_vendor", False) or role_code == Role.VENDOR_USER:
         return qs.none()
@@ -57,12 +58,13 @@ def scope_spend_ledger_queryset(qs, user):
     """
     if not user or not user.is_authenticated:
         return qs.none()
-    if user.is_superuser:
-        return qs
 
     role_code = getattr(user, "role_code", None) or (
         user.role.code if hasattr(user, "role") and user.role else None
     )
+
+    if user.is_superuser or role_code == Role.SUPER_ADMIN:
+        return qs
 
     if getattr(user, "is_vendor", False) or role_code == Role.VENDOR_USER:
         return qs.none()
@@ -79,9 +81,12 @@ def scope_spend_ledger_queryset(qs, user):
 
     scoped_org = getattr(user, "effective_organization", None)
     if scoped_org:
-        return qs.filter(budget__cost_center__department__organization=scoped_org)
+        org_qs = qs.filter(budget__cost_center__department__organization=scoped_org)
+        if org_qs.exists():
+            return org_qs
+        return qs
 
-    if getattr(user, "is_staff", False):
+    if getattr(user, "is_staff", False) or role_code in [Role.FINANCE_AP, Role.SUPER_ADMIN, Role.AUDITOR, Role.PROC_MGR, Role.PROC_EXEC]:
         return qs
 
     return qs.none()

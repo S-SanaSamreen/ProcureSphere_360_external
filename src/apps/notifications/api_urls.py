@@ -8,6 +8,7 @@ from rest_framework.response import Response
 from rest_framework.routers import DefaultRouter
 
 from .models import Notification
+from .selectors import scope_notifications_for_user
 
 HIGH_PRIORITY_TYPES = [
     Notification.TYPE_APPROVAL_REQUIRED,
@@ -21,6 +22,19 @@ HIGH_PRIORITY_TYPES = [
 
 
 class NotificationSerializer(serializers.ModelSerializer):
+    def validate_target_url(self, value):
+        if not value:
+            return ""
+        val = value.strip()
+        if "://" in val or not val.startswith("/"):
+            raise serializers.ValidationError("Target URL must be a relative internal URL path starting with '/'.")
+        return val
+
+    def validate(self, attrs):
+        if self.instance and "recipient" in attrs:
+            if attrs["recipient"] != self.instance.recipient:
+                raise serializers.ValidationError({"recipient": "Notification recipient cannot be changed once assigned."})
+        return attrs
     recipient = serializers.PrimaryKeyRelatedField(
         queryset=Notification._meta.get_field("recipient").remote_field.model.objects.all(),
         required=False,
@@ -31,6 +45,8 @@ class NotificationSerializer(serializers.ModelSerializer):
         source="get_notification_type_display", read_only=True
     )
     is_high_priority = serializers.SerializerMethodField()
+    read = serializers.BooleanField(source="is_read", required=False)
+    read_at = serializers.SerializerMethodField()
 
     class Meta:
         model = Notification
@@ -43,16 +59,47 @@ class NotificationSerializer(serializers.ModelSerializer):
             "title",
             "message",
             "is_read",
+            "read",
+            "read_at",
             "target_url",
             "is_high_priority",
             "created_at",
             "updated_at",
         ]
 
+    def get_read_at(self, obj):
+        if not obj.is_read:
+            return None
+        return obj.updated_at.isoformat()
+
     def to_internal_value(self, data):
+        if not isinstance(data, dict):
+            raise serializers.ValidationError(
+                {"non_field_errors": ["Invalid payload format. Expected a JSON object of key-value pairs, but received a list."]}
+            )
+        allowed_fields = {
+            "recipient",
+            "notification_type",
+            "type",
+            "title",
+            "message",
+            "is_read",
+            "read",
+            "target_url",
+            "is_high_priority",
+            "read_at",
+        }
+        unknown_fields = [k for k in data.keys() if k not in allowed_fields]
+        if unknown_fields:
+            raise serializers.ValidationError(
+                {field: f"Unknown or disallowed field: {field}." for field in unknown_fields}
+            )
+
         data_copy = data.copy() if hasattr(data, "copy") else dict(data)
         if "type" in data_copy and "notification_type" not in data_copy:
             data_copy["notification_type"] = data_copy["type"]
+        if "read" in data_copy and "is_read" not in data_copy:
+            data_copy["is_read"] = data_copy["read"]
         if "recipient" in data_copy and str(data_copy["recipient"]).lower() == "self":
             request = self.context.get("request")
             if request and request.user:
@@ -80,7 +127,9 @@ class NotificationViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        qs = self.queryset.filter(recipient=user).order_by("-created_at")
+        qs = scope_notifications_for_user(
+            self.queryset.filter(recipient=user), user
+        ).order_by("-created_at")
 
         # Filter by read status
         is_read_param = self.request.query_params.get("is_read", "").strip().lower()
@@ -122,7 +171,9 @@ class NotificationViewSet(viewsets.ModelViewSet):
         Returns live KPI counters for the user's notification inbox.
         """
         user = request.user
-        base_qs = Notification.objects.filter(recipient=user)
+        base_qs = scope_notifications_for_user(
+            Notification.objects.filter(recipient=user), user
+        )
 
         total_count = base_qs.count()
         unread_count = base_qs.filter(is_read=False).count()
@@ -188,7 +239,10 @@ class NotificationViewSet(viewsets.ModelViewSet):
         POST /api/v1/notifications/mark-all-read/
         Marks all notifications for the authenticated user as read.
         """
-        updated_count = Notification.objects.filter(recipient=request.user, is_read=False).update(
+        updated_count = scope_notifications_for_user(
+            Notification.objects.filter(recipient=request.user, is_read=False),
+            request.user,
+        ).update(
             is_read=True, updated_at=timezone.now()
         )
         return Response(
