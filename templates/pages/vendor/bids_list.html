@@ -29,7 +29,7 @@
     <!-- Navigation Tabs -->
     <div class="card glass-card border-0 shadow-sm mb-4">
         <div class="card-body p-3">
-            <ul class="nav nav-pills gap-2">
+            <ul class="nav nav-pills vendor-scrollable-pills flex-nowrap overflow-x-auto gap-2">
                 <li class="nav-item">
                     <a class="nav-link rounded-pill px-3 py-1 small fw-semibold {% if tab == 'draft' %}active{% else %}text-secondary{% endif %}" href="?tab=draft">
                         Draft Bids <span class="badge bg-warning bg-opacity-25 text-dark ms-1">{{ tab_counts.draft }}</span>
@@ -93,7 +93,7 @@
                             <td>
                                 <span class="badge bg-dark">{{ item.event.event_type }}</span>
                             </td>
-                            <td class="fw-bold text-dark fs-6">${{ item.bid.total_bid_amount|floatformat:2 }}</td>
+                            <td class="fw-bold text-dark fs-6">₹{{ item.bid.total_bid_amount|floatformat:2 }}</td>
                             <td>
                                 <span class="badge bg-secondary rounded-pill">V{{ item.bid.version }}</span>
                             </td>
