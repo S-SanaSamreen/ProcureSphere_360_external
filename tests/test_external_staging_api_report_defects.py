@@ -124,3 +124,30 @@ class TestExternalStagingAPIDefectRemediations:
         assert data["error"]["code"] == "VALIDATION_ERROR"
         # Check details for title validation error
         assert "title" in str(data["error"]["details"]).lower()
+
+    def test_smk_335_procurement_manager_can_approve_requisition_step_2(self, org_and_users):
+        """SMK_335 / DEF-004: Procurement Manager must not receive 403 when approving requisition."""
+        from django.utils import timezone
+        role_pm = Role.objects.get_or_create(code=Role.PROC_MGR, defaults={"name": "Procurement Manager"})[0]
+        pm_user = User.objects.create_user(
+            email="pm_approver@test.com", password="password123", role=role_pm, organization=org_and_users["org"]
+        )
+        pr = PurchaseRequisition.objects.create(
+            pr_number="PR-TEST-SMK-335",
+            title="SMK 335 Test PR",
+            justification="Valid justification text",
+            requester=org_and_users["requester"],
+            department=org_and_users["dept"],
+            cost_center=org_and_users["cc"],
+            status=PurchaseRequisition.STATUS_MANAGER_REVIEW,
+            total_amount=Decimal("1000.00"),
+            requested_delivery_date=timezone.now().date(),
+        )
+        client = Client()
+        client.force_login(pm_user)
+        response = client.post(
+            f"/api/v1/requisitions/{pr.id}/approve/",
+            {"comments": "Procurement Manager approved"},
+            content_type="application/json",
+        )
+        assert response.status_code != status.HTTP_403_FORBIDDEN

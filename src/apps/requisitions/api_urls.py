@@ -416,6 +416,7 @@ class CanCreateRequisitionPermission(permissions.BasePermission):
             if action in ["approve", "reject"]:
                 return role_code in [
                     Role.DEPT_APPROVER,
+                    Role.PROC_MGR,
                     Role.FINANCE_AP,
                     Role.SUPER_ADMIN,
                 ]
