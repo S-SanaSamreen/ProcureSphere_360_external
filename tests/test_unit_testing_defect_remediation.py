@@ -1,18 +1,19 @@
-import pytest
 from decimal import Decimal
 from unittest.mock import MagicMock
+
+import pytest
 from django.conf import settings
 from django.test import RequestFactory, override_settings
 from django.urls import reverse
 from rest_framework import status
 
 from apps.accounts.models import Role, User
-from apps.organization.models import Organization, Department
 from apps.approvals.models import ApprovalPolicy, ApprovalStep
 from apps.approvals.services import evaluate_approval_chain
 from apps.contracts.permissions import CanManageContract
 from apps.core.context_processors import layout_context
 from apps.core.exceptions import custom_exception_handler
+from apps.organization.models import Department, Organization
 
 
 @pytest.mark.django_db
@@ -23,6 +24,9 @@ class TestUnitDefectRemediation:
         Evaluating an approval policy with zero steps must return [] and NOT
         execute database write mutations (no ApprovalStep.objects.get_or_create).
         """
+        # Ensure other existing policies don't interfere with this isolated zero-step test
+        ApprovalPolicy.objects.filter(is_active=True).update(is_active=False)
+
         org = Organization.objects.create(name="Zero Steps Org", code="ZS-ORG")
         dept = Department.objects.create(organization=org, name="Zero Steps Dept", code="ZSD")
         policy = ApprovalPolicy.objects.create(
@@ -72,7 +76,7 @@ class TestUnitDefectRemediation:
         DEF-003:
         When settings.DEBUG is True, exception details should be exposed for developer debugging.
         """
-        exc = ValueError("Debug mode explicit error message")
+        exc = RuntimeError("Debug mode explicit error message")
         context = {"request": MagicMock()}
 
         with override_settings(DEBUG=True):
@@ -162,8 +166,9 @@ class TestUnitDefectRemediation:
           File accepted: signature check must read from the start of the file (seek(0)),
           and restore pointer afterwards.
         """
-        from apps.core.validators import validate_pr_attachment
         from django.core.files.uploadedfile import SimpleUploadedFile
+
+        from apps.core.validators import validate_pr_attachment
 
         valid_pdf = SimpleUploadedFile(
             "quote.pdf",

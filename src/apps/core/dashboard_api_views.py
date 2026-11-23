@@ -16,7 +16,6 @@ from apps.invoices.models import MatchException
 from apps.organization.models import CostCenter, Department, Organization
 from apps.requisitions.models import PurchaseRequisition
 
-
 # --- Serializers for OpenAPI Schema Documentation ---
 
 class SuperAdminDashboardResponseSerializer(serializers.Serializer):
@@ -243,11 +242,11 @@ class DepartmentApproverDashboardAPIView(APIView):
             ccs = CostCenter.objects.filter(department=user_dept)
             budgets = Budget.objects.filter(cost_center__in=ccs)
             for b in budgets:
-                available_budget += (b.allocated_amount - b.actual_spend - b.committed_spend)
+                available_budget += b.available_amount
         elif user_org:
             budgets = Budget.objects.filter(cost_center__department__organization=user_org)
             for b in budgets:
-                available_budget += (b.allocated_amount - b.actual_spend - b.committed_spend)
+                available_budget += b.available_amount
 
         data = {
             "department_name": user_dept.name if user_dept else "All Departments",
@@ -291,12 +290,30 @@ class DepartmentApproverQueueAPIView(APIView):
         ).order_by("-created_at")
 
         if user_dept:
-            prs_qs = prs_qs.filter(Q(department=user_dept) | Q(department__organization=user_dept.organization))
+            if user_dept.organization:
+                prs_qs = prs_qs.filter(Q(department=user_dept) | Q(department__organization=user_dept.organization))
+            else:
+                prs_qs = prs_qs.filter(department=user_dept)
         elif user_org:
             prs_qs = prs_qs.filter(department__organization=user_org)
 
         results = []
         for pr in prs_qs:
+            currency = getattr(pr, "currency", None)
+            if not currency:
+                from apps.approvals.models import ApprovalPolicy
+                policy = ApprovalPolicy.objects.filter(
+                    module=ApprovalPolicy.MODULE_PR,
+                    is_active=True,
+                ).filter(
+                    Q(all_departments=True) | Q(department=pr.department)
+                ).first()
+                currency = policy.currency if policy and policy.currency else "USD"
+
+            urgency = getattr(pr, "urgency", None)
+            if not urgency:
+                urgency = "HIGH" if getattr(pr, "total_amount", Decimal("0.00")) > Decimal("50000.00") else "NORMAL"
+
             results.append({
                 "id": pr.id,
                 "pr_number": pr.pr_number,
@@ -305,10 +322,10 @@ class DepartmentApproverQueueAPIView(APIView):
                 "department_name": pr.department.name if pr.department else "Unassigned",
                 "cost_center_code": pr.cost_center.code if pr.cost_center else None,
                 "total_amount": pr.total_amount,
-                "currency": pr.currency,
+                "currency": currency,
                 "status": pr.status,
                 "created_at": pr.created_at,
-                "urgency": pr.urgency,
+                "urgency": urgency,
             })
         return Response(results, status=status.HTTP_200_OK)
 
