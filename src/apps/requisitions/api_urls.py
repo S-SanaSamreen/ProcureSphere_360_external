@@ -97,12 +97,27 @@ class PurchaseRequisitionSerializer(serializers.ModelSerializer):
         ]
 
     def get_resolved_route(self, obj):
-        from apps.approvals.models import ApprovalPolicy
-        from apps.approvals.services import evaluate_approval_chain
+        # Cache route evaluations on serializer context/request to prevent N+1 query storms and gateway timeouts
+        cache = self.context.get("_route_cache")
+        if cache is None and "request" in self.context:
+            cache = getattr(self.context["request"], "_route_cache", None)
+            if cache is None:
+                cache = {}
+                setattr(self.context["request"], "_route_cache", cache)
 
         amount = getattr(obj, "total_amount", None) or Decimal("0.00")
         dept = getattr(obj, "department", None)
         cc = getattr(obj, "cost_center", None)
+        dept_id = str(getattr(obj, "department_id", None))
+        cc_id = str(getattr(obj, "cost_center_id", None))
+        cache_key = (dept_id, cc_id, str(amount))
+
+        if cache is not None and cache_key in cache:
+            return cache[cache_key]
+
+        from apps.approvals.models import ApprovalPolicy
+        from apps.approvals.services import evaluate_approval_chain
+
         try:
             chain = evaluate_approval_chain(
                 module=ApprovalPolicy.MODULE_PR,
@@ -127,9 +142,22 @@ class PurchaseRequisitionSerializer(serializers.ModelSerializer):
                     "approver": spec_approver.email if spec_approver else None,
                     "is_mandatory": s.get("is_mandatory", True),
                 })
-            return {"steps": steps}
+            res = {"steps": steps}
+            if cache is not None:
+                cache[cache_key] = res
+            return res
         except Exception:
             return {"steps": []}
+
+    def validate_title(self, value):
+        from apps.core.validators import validate_no_html_or_script
+
+        return validate_no_html_or_script(value, field_label="Title")
+
+    def validate_justification(self, value):
+        from apps.core.validators import validate_no_html_or_script
+
+        return validate_no_html_or_script(value, field_label="Justification")
 
     def validate_requested_delivery_date(self, value):
         from django.utils import timezone

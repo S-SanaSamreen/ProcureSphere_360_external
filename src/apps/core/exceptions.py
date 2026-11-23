@@ -207,10 +207,10 @@ def custom_exception_handler(exc, context):
     logger.exception("Unhandled server error: %s", exc)
 
     # Sanitize exception details in production to prevent CWE-209 information disclosure
-    is_test_or_debug = getattr(settings, "DEBUG", False) or getattr(settings, "TESTING", False) or "test" in getattr(settings, "SETTINGS_MODULE", "")
+    is_debug = getattr(settings, "DEBUG", False)
     details = (
         str(exc)
-        if is_test_or_debug
+        if is_debug
         else "An unexpected error occurred. Please contact the system administrator."
     )
 
