@@ -442,7 +442,7 @@ def run_3_way_match_service(
         from apps.notifications.services import notify_role_users
 
         notify_role_users(
-            role_codes=[Role.FINANCE_AP, Role.SUPER_ADMIN],
+            role_codes=[Role.SUPER_ADMIN],
             notification_type=Notification.TYPE_EXCEPTION_RAISED,
             title=f"3-Way Match Exception: Invoice {invoice.invoice_number}",
             message=f"Invoice {invoice.invoice_number} from {invoice.vendor.legal_name} triggered {len(exceptions)} variance exception(s).",
@@ -634,6 +634,11 @@ def approve_supplier_invoice_service(
     if invoice.status == SupplierInvoice.STATUS_REJECTED:
         raise ValidationError(
             f"Cannot approve invoice '{invoice.invoice_number}': Invoice is in REJECTED status."
+        )
+
+    if invoice.status in [SupplierInvoice.STATUS_RECEIVED, SupplierInvoice.STATUS_VALIDATION] or not invoice.match_results.exists():
+        raise ValidationError(
+            f"Cannot approve invoice '{invoice.invoice_number}': Invoice must complete 3-way matching before approval."
         )
 
     open_exceptions_count = invoice.exceptions.filter(status=MatchException.STATUS_OPEN).count()

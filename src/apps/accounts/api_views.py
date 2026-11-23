@@ -50,6 +50,29 @@ class SessionLoginView(views.APIView):
         tags=["Authentication"],
     )
     def post(self, request, *args, **kwargs):
+        # Validate Origin to prevent cross-origin Login CSRF (DEF-RBAC-009)
+        origin = request.META.get("HTTP_ORIGIN") or (request.headers.get("Origin") if hasattr(request, "headers") else None)
+        if origin:
+            try:
+                from urllib.parse import urlparse
+                from django.conf import settings
+                origin_host = urlparse(origin).netloc.lower()
+                request_host = request.get_host().lower()
+                trusted = getattr(settings, "CSRF_TRUSTED_ORIGINS", [])
+                trusted_hosts = [urlparse(t).netloc.lower() for t in trusted if "://" in t]
+                if origin_host != request_host and origin_host not in trusted_hosts:
+                    return Response(
+                        {
+                            "error": {
+                                "code": "FORBIDDEN",
+                                "message": "Cross-origin login requests are not permitted.",
+                            }
+                        },
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
+            except Exception:
+                pass
+
         if not isinstance(request.data, dict):
             return Response(
                 {

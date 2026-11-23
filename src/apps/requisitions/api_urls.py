@@ -449,8 +449,13 @@ class PurchaseRequisitionViewSet(viewsets.ModelViewSet):
             user.role.code if hasattr(user, "role") and user.role else None
         )
 
-        # External vendor users have zero access to requisitions
-        if getattr(user, "is_vendor", False) or role_code in [Role.VENDOR_USER, "VENDOR_USER"]:
+        # External vendor users, stores receivers, and legal managers have zero access to requisitions
+        if getattr(user, "is_vendor", False) or role_code in [
+            Role.VENDOR_USER,
+            "VENDOR_USER",
+            Role.STORES_RECEIVER,
+            Role.LEGAL_MGR,
+        ]:
             from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("Access to purchase requisitions is denied for your role.")
 
@@ -460,8 +465,6 @@ class PurchaseRequisitionViewSet(viewsets.ModelViewSet):
             Role.PROC_MGR,
             Role.AUDITOR,
             Role.FINANCE_AP,
-            Role.STORES_RECEIVER,
-            Role.LEGAL_MGR,
         ]:
             qs = self.queryset
         elif role_code == Role.DEPT_APPROVER:

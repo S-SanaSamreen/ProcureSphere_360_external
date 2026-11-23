@@ -170,7 +170,7 @@ def validate_tax_id_number(value: str) -> str:
         raise ValidationError(_("Tax identification number is required."))
     if len(val) < 5 or len(val) > 30:
         raise ValidationError(
-            _("Tax identification number must be between 6 and 30 characters.")
+            _("Tax identification number must be between 5 and 30 characters.")
         )
     if "--" in val or "//" in val or val.startswith("-") or val.endswith("-"):
         raise ValidationError(

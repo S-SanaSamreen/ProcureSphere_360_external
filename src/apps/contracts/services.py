@@ -862,7 +862,7 @@ def scan_contract_expirations_and_milestones_service() -> int:
         if not ContractAlert.objects.filter(
             contract=milestone.contract,
             alert_type=ContractAlert.ALERT_MILESTONE,
-            message__contains=milestone.title,
+            message__startswith=f"Milestone '{milestone.title}' for contract",
         ).exists():
             msg = f"Milestone '{milestone.title}' for contract '{milestone.contract.contract_number}' is due on {milestone.due_date}."
             ContractAlert.objects.create(
@@ -888,7 +888,7 @@ def scan_contract_expirations_and_milestones_service() -> int:
         if not ContractAlert.objects.filter(
             contract=obligation.contract,
             alert_type=ContractAlert.ALERT_OBLIGATION,
-            message__contains=obligation.title,
+            message__startswith=f"Legal Obligation '{obligation.title}' (",
         ).exists():
             msg = f"Legal Obligation '{obligation.title}' ({obligation.responsible_party}) for contract '{obligation.contract.contract_number}' is due on {obligation.due_date}."
             ContractAlert.objects.create(

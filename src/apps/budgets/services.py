@@ -28,6 +28,9 @@ def allocate_budget_service(
     """
     Allocates budget to a CostCenter for a FiscalPeriod inside an atomic transaction.
     """
+    if allocated_amount < Decimal("0.00"):
+        raise ValidationError("Allocated budget amount cannot be negative.")
+
     budget, created = Budget.objects.get_or_create(
         cost_center=cost_center,
         fiscal_period=fiscal_period,
@@ -70,13 +73,23 @@ def validate_budget_availability_service(*, cost_center: CostCenter, amount: Dec
 
     if not budget:
         from apps.organization.models import FiscalPeriod
-        fp = FiscalPeriod.objects.filter(is_closed=False).order_by("-start_date").first()
+        org = getattr(cost_center, "organization", None) or getattr(getattr(cost_center, "department", None), "organization", None)
+        if not org:
+            from apps.organization.models import Organization
+            org = Organization.objects.first()
+
+        if Budget.objects.filter(cost_center=cost_center, fiscal_period__is_closed=True).exists() and not Budget.objects.filter(cost_center=cost_center, fiscal_period__is_closed=False).exists():
+            raise ValidationError(
+                f"Insufficient budget in Cost Center '{cost_center.code}'. Fiscal period is closed."
+            )
+
+        fp = FiscalPeriod.objects.filter(organization=org, is_closed=False).order_by("-start_date").first()
         if not fp:
+            if FiscalPeriod.objects.filter(organization=org, is_closed=True).exists():
+                raise ValidationError(
+                    f"Insufficient budget in Cost Center '{cost_center.code}'. All fiscal periods are closed."
+                )
             year = today.year
-            org = getattr(cost_center, "organization", None) or getattr(getattr(cost_center, "department", None), "organization", None)
-            if not org:
-                from apps.organization.models import Organization
-                org = Organization.objects.first()
             fp, _ = FiscalPeriod.objects.get_or_create(
                 organization=org,
                 year=year,
@@ -147,13 +160,23 @@ def check_and_reserve_budget_service(
 
     if not budget:
         from apps.organization.models import FiscalPeriod
-        fp = FiscalPeriod.objects.filter(is_closed=False).order_by("-start_date").first()
+        org = getattr(cost_center, "organization", None) or getattr(getattr(cost_center, "department", None), "organization", None)
+        if not org:
+            from apps.organization.models import Organization
+            org = Organization.objects.first()
+
+        if Budget.objects.filter(cost_center=cost_center, fiscal_period__is_closed=True).exists() and not Budget.objects.filter(cost_center=cost_center, fiscal_period__is_closed=False).exists():
+            raise ValidationError(
+                f"Insufficient budget in Cost Center '{cost_center.code}'. Fiscal period is closed."
+            )
+
+        fp = FiscalPeriod.objects.filter(organization=org, is_closed=False).order_by("-start_date").first()
         if not fp:
+            if FiscalPeriod.objects.filter(organization=org, is_closed=True).exists():
+                raise ValidationError(
+                    f"Insufficient budget in Cost Center '{cost_center.code}'. All fiscal periods are closed."
+                )
             year = today.year
-            org = getattr(cost_center, "organization", None) or getattr(getattr(cost_center, "department", None), "organization", None)
-            if not org:
-                from apps.organization.models import Organization
-                org = Organization.objects.first()
             fp, _ = FiscalPeriod.objects.get_or_create(
                 organization=org,
                 year=year,
@@ -233,7 +256,40 @@ def convert_commitment_to_actual_service(*, po, invoice, user) -> SpendLedger:
     Moves spend from COMMITMENT to ACTUAL when an invoice is approved/paid.
     """
     cost_center = po.cost_center
-    budget = Budget.objects.filter(cost_center=cost_center).order_by("-created_at").first()
+    target_date = getattr(invoice, "invoice_date", None)
+    if not target_date and getattr(po, "created_at", None):
+        target_date = po.created_at.date() if hasattr(po.created_at, "date") else po.created_at
+    if not target_date:
+        from django.utils import timezone
+        target_date = timezone.now().date()
+
+    budget = (
+        Budget.objects.select_for_update()
+        .filter(
+            cost_center=cost_center,
+            fiscal_period__start_date__lte=target_date,
+            fiscal_period__end_date__gte=target_date,
+            fiscal_period__is_closed=False,
+        )
+        .first()
+    )
+    if not budget:
+        budget = (
+            Budget.objects.select_for_update()
+            .filter(
+                cost_center=cost_center,
+                fiscal_period__is_closed=False,
+            )
+            .order_by("-fiscal_period__start_date")
+            .first()
+        )
+    if not budget:
+        budget = (
+            Budget.objects.select_for_update()
+            .filter(cost_center=cost_center)
+            .order_by("-fiscal_period__start_date")
+            .first()
+        )
     if not budget:
         raise ValidationError(f"No budget found for Cost Center '{cost_center.code}'.")
 

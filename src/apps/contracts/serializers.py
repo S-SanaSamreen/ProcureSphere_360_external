@@ -116,6 +116,26 @@ class ContractSerializer(serializers.ModelSerializer):
         vendor = attrs.get("vendor", getattr(self.instance, "vendor", None))
         start_date = attrs.get("start_date", getattr(self.instance, "start_date", None))
         end_date = attrs.get("end_date", getattr(self.instance, "end_date", None))
+        contract_value = attrs.get("contract_value", getattr(self.instance, "contract_value", None))
+
+        if start_date and end_date:
+            sd_str = start_date.isoformat() if hasattr(start_date, "isoformat") else str(start_date)
+            ed_str = end_date.isoformat() if hasattr(end_date, "isoformat") else str(end_date)
+            if ed_str < sd_str:
+                raise serializers.ValidationError(
+                    {"end_date": ["End date cannot be earlier than start date."]}
+                )
+
+        if contract_value is not None:
+            try:
+                from decimal import Decimal
+                if Decimal(str(contract_value)) < Decimal("0.00"):
+                    raise serializers.ValidationError(
+                        {"contract_value": ["Contract value cannot be negative."]}
+                    )
+            except (ValueError, TypeError):
+                pass
+
         if self.instance is None and title and vendor and start_date and end_date:
             if Contract.objects.filter(
                 vendor=vendor,

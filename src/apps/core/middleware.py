@@ -140,6 +140,15 @@ class SecurityHeadersMiddleware:
         if "Permissions-Policy" not in response:
             response["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
 
+        if "X-Content-Type-Options" not in response:
+            response["X-Content-Type-Options"] = "nosniff"
+
+        # Prevent browser/proxy caching for authenticated requests (DEF-RBAC-014)
+        if getattr(request, "user", None) and request.user.is_authenticated:
+            response["Cache-Control"] = "no-cache, no-store, must-revalidate, private"
+            response["Pragma"] = "no-cache"
+            response["Expires"] = "0"
+
         # Enforce secure cookies on HTTPS/TLS reverse proxies (DEF-007)
         if request.is_secure() or request.headers.get("X-Forwarded-Proto") == "https":
             if "sessionid" in response.cookies:
@@ -176,7 +185,6 @@ class VendorPortalIsolationMiddleware:
         "/audit",
         "/admin",
         "/api/v1/requisitions",
-        "/api/v1/contracts",
         "/api/v1/budgets",
         "/api/v1/reports",
         "/api/v1/audit",

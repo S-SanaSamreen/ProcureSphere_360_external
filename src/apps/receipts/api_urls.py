@@ -241,9 +241,6 @@ class GoodsReceiptPermission(IsAuthenticated):
 
         if request.method in SAFE_METHODS:
             if role_code == Role.VENDOR_USER:
-                # Vendors can list their own PO receipts (GRN-010) but cannot inspect internal GRN detail (GRN-036)
-                if getattr(view, "action", None) == "retrieve":
-                    return False
                 return True
             return role_code in [
                 Role.STORES_RECEIVER,
@@ -258,6 +255,18 @@ class GoodsReceiptPermission(IsAuthenticated):
             return False
 
         return role_code in [Role.STORES_RECEIVER, Role.SUPER_ADMIN]
+
+    def has_object_permission(self, request, view, obj):
+        if request.user.is_superuser:
+            return True
+        role_code = getattr(request.user, "role_code", None) or (
+            request.user.role.code if hasattr(request.user, "role") and request.user.role else None
+        )
+        if role_code == Role.VENDOR_USER:
+            if request.method in SAFE_METHODS:
+                return bool(request.user.vendor_id and obj.po.vendor_id == request.user.vendor_id)
+            return False
+        return True
 
 
 class GoodsReceiptViewSet(viewsets.ModelViewSet):

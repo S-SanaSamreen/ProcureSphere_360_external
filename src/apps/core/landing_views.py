@@ -223,8 +223,6 @@ ABOUT_SECTION_MAP = {
 @require_GET
 def roles(request):
     """Public roles and access overview page."""
-    if request.user.is_authenticated:
-        logout(request)
     context = {
         'page_title': 'Enterprise Roles & Governance — ProcureSphere 360',
         'page_description': (
