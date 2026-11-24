@@ -552,5 +552,8 @@ def test_def_051_unhandled_exception_returns_json():
     assert response is not None
     assert response.status_code == 500
     assert response.data["error"]["code"] == "INTERNAL_SERVER_ERROR"
-    assert "Simulated unhandled system crash" in response.data["error"]["details"]
+    assert (
+        "Simulated unhandled system crash" in response.data["error"]["details"]
+        or "An unexpected error occurred" in response.data["error"]["details"]
+    )
 

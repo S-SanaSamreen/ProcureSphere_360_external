@@ -46,15 +46,15 @@ class CanManageSupplierInvoice(BasePermission):
             or role_code in [Role.VENDOR_USER, "VENDOR_USER"]
         )
 
-        # Vendors cannot pay, run match, create line-item invoices via internal endpoint, or access match exceptions
+        # Vendors cannot pay, run match, create line-item invoices via internal endpoint, or modify match exceptions
         if is_vendor:
             basename = getattr(view, "basename", "")
             action = getattr(view, "action", "")
-            if "exception" in basename or "exception" in action:
+            if action in ["resolve", "pay_invoice", "pay", "run_match", "run_3_way_match"]:
+                return False
+            if "exception" in basename and request.method not in SAFE_METHODS:
                 return False
             if action == "create_invoice":
-                return False
-            if action in ["pay_invoice", "pay", "run_match", "run_3_way_match"]:
                 return False
             if request.method in SAFE_METHODS:
                 return True

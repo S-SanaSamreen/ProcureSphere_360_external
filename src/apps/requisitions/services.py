@@ -90,8 +90,19 @@ def create_purchase_requisition_service(
 
     total = Decimal("0.00")
     for item in line_items:
-        qty = Decimal(str(item["quantity"]))
-        unit_price = Decimal(str(item["estimated_unit_price"]))
+        if "quantity" not in item:
+            raise ValidationError(f"Quantity is required for line item '{item.get('item_description', '')}'.")
+        if "estimated_unit_price" not in item:
+            raise ValidationError(f"Estimated unit price is required for line item '{item.get('item_description', '')}'.")
+        try:
+            qty = Decimal(str(item["quantity"]))
+        except Exception:
+            raise ValidationError(f"Quantity for line item '{item.get('item_description', '')}' must be a valid number.")
+        try:
+            unit_price = Decimal(str(item["estimated_unit_price"]))
+        except Exception:
+            raise ValidationError(f"Estimated unit price for line item '{item.get('item_description', '')}' must be a valid number.")
+
         if qty <= Decimal("0.00"):
             raise ValidationError(
                 f"Quantity for line item '{item.get('item_description', '')}' must be greater than zero."
@@ -586,6 +597,15 @@ def reject_purchase_requisition_service(
         raise ValidationError("Rejection justification comments are mandatory.")
 
     from apps.accounts.models import Role
+    target_org = getattr(requisition.department, "organization", None) or (
+        requisition.cost_center.department.organization if requisition.cost_center and requisition.cost_center.department else None
+    )
+    approver_org = getattr(approver, "effective_organization", None) or getattr(approver, "organization", None)
+    if target_org and approver_org and target_org.id != approver_org.id and not (approver.is_superuser and not getattr(approver, "organization_id", None)):
+        raise ValidationError(
+            f"Access Denied: You cannot reject requisitions belonging to another organization ({target_org.name})."
+        )
+
     if requisition.requester_id == approver.id and not approver.is_superuser:
         raise ValidationError("Self-rejection is prohibited: Requesters cannot reject their own Purchase Requisitions via approver workflow.")
 

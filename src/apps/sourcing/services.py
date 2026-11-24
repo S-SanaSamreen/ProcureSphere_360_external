@@ -917,11 +917,20 @@ def submit_vendor_bid_service(
             raise ValidationError(
                 "Cannot submit: This bid has already been withdrawn and cannot be re-submitted."
             )
+        if bid.status in (VendorBid.STATUS_SUBMITTED, VendorBid.STATUS_AMENDED):
+            raise ValidationError(
+                "Cannot submit: This bid has already been submitted. Use the amendment workflow to modify your bid."
+            )
         bid.status = VendorBid.STATUS_SUBMITTED
         bid.proposal_summary = proposal_summary
         bid.technical_proposal = technical_proposal or bid.technical_proposal
         bid.commercial_proposal = commercial_proposal or bid.commercial_proposal
         bid.submitted_at = timezone.now()
+
+    if not line_items and not (bid and bid.lines.exists()):
+        raise ValidationError(
+            "At least one commercial line item with quantity and price is required to submit a bid."
+        )
 
     if line_items:
         bid.lines.all().delete()
@@ -1645,7 +1654,7 @@ def evaluate_and_award_sourcing_event_service(
     recommender = recommended_by or event.created_by
     if not recommender or (recommender.id == approved_by_user.id and not getattr(approved_by_user, "is_superuser", False)):
         alt_evaluator = (
-            User.objects.filter(bidevaluation__bid__event=event)
+            User.objects.filter(evaluations__bid__event=event)
             .exclude(id=approved_by_user.id)
             .first()
         )
@@ -1678,9 +1687,14 @@ def evaluate_and_award_sourcing_event_service(
                 winning_bid=winning_bid,
                 award_reason=award_reason.strip(),
                 status=AwardDecision.STATUS_PENDING,
-                recommended_by=approved_by_user,
-                created_by=approved_by_user,
+                recommended_by=recommender,
+                created_by=recommender,
             )
+        else:
+            if pending.winning_bid_id != winning_bid.id:
+                pending.winning_bid = winning_bid
+            pending.award_reason = award_reason.strip()
+            pending.save(update_fields=["winning_bid", "award_reason", "updated_at"])
     else:
         raise ValidationError(f"Event cannot be awarded from status {event.status}.")
 

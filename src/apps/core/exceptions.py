@@ -91,6 +91,7 @@ def custom_exception_handler(exc, context):
                         "code": "DUPLICATE_RESOURCE",
                         "message": "A Purchase Order with this PO number already exists.",
                         "details": {"po_number": ["Purchase Order with this PO number already exists."]},
+                        "request_id": req_id,
                     }
                 },
                 status=status.HTTP_409_CONFLICT,
@@ -102,6 +103,7 @@ def custom_exception_handler(exc, context):
                         "code": "DUPLICATE_RESOURCE",
                         "message": "A Goods Receipt with this GRN or Delivery Note already exists.",
                         "details": {"grn_number": ["Goods receipt with this identifier already exists."]},
+                        "request_id": req_id,
                     }
                 },
                 status=status.HTTP_409_CONFLICT,

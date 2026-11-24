@@ -15,6 +15,37 @@ from apps.vendors.models import Vendor
 from .models import POAmendment, POLine, PurchaseOrder
 
 
+def _get_budget_for_po(po, cost_center=None, for_update=False):
+    cc = cost_center or getattr(po, "cost_center", None)
+    if not cc:
+        return None
+    from apps.budgets.models import Budget
+    from django.utils import timezone
+    target_date = getattr(po, "created_at", None)
+    if target_date and hasattr(target_date, "date"):
+        target_date = target_date.date()
+    else:
+        target_date = timezone.now().date()
+    
+    qs = Budget.objects.select_for_update() if for_update else Budget.objects
+    budget = qs.filter(
+        cost_center=cc,
+        fiscal_period__start_date__lte=target_date,
+        fiscal_period__end_date__gte=target_date,
+        fiscal_period__is_closed=False,
+    ).first()
+    if not budget:
+        budget = qs.filter(
+            cost_center=cc,
+            fiscal_period__is_closed=False,
+        ).order_by("-fiscal_period__start_date").first()
+    if not budget:
+        budget = qs.filter(cost_center=cc).order_by("-fiscal_period__start_date").first()
+    if not budget:
+        budget = qs.filter(cost_center=cc).first()
+    return budget
+
+
 @transaction.atomic
 def generate_purchase_order_service(
     *,
@@ -81,6 +112,9 @@ def generate_purchase_order_service(
     )
 
     subtotal = Decimal("0.00")
+    if not line_items:
+        raise ValidationError("A Purchase Order must contain at least one line item.")
+
     for item in line_items:
         qty = Decimal(str(item["quantity"]))
         unit_price = Decimal(str(item["unit_price"]))
@@ -98,10 +132,10 @@ def generate_purchase_order_service(
         )
         subtotal += line.line_total
 
-    tax = subtotal * tax_rate
-    total = subtotal + tax
+    tax = (subtotal * tax_rate).quantize(Decimal("0.01"))
+    total = (subtotal + tax).quantize(Decimal("0.01"))
 
-    po.subtotal = subtotal
+    po.subtotal = subtotal.quantize(Decimal("0.01"))
     po.tax_amount = tax
     po.total_amount = total
     po.save(update_fields=["subtotal", "tax_amount", "total_amount", "updated_at"])
@@ -120,11 +154,7 @@ def generate_purchase_order_service(
 
     # Move BudgetReservation to SpendLedger COMMITMENT only if PO is in ISSUED status
     if initial_status == PurchaseOrder.STATUS_ISSUED:
-        budget = (
-            Budget.objects.filter(cost_center=cost_center)
-            .order_by("-created_at")
-            .first()
-        )
+        budget = _get_budget_for_po(po, cost_center, for_update=True)
         if budget:
             budget.committed_amount += total
             budget.save(update_fields=["committed_amount", "updated_at"])
@@ -441,18 +471,14 @@ def request_po_amendment_service(
                     f"Cannot delete line '{line.item_description}' referenced by goods receipts."
                 )
 
-    tax = subtotal * tax_rate
-    proposed_total = subtotal + tax
+    tax = (subtotal * tax_rate).quantize(Decimal("0.01"))
+    proposed_total = (subtotal + tax).quantize(Decimal("0.01"))
     old_total = Decimal(str(snapshot["total_amount"]))
     delta = proposed_total - old_total
 
     # Verify Budget availability if delta > 0
     if delta > Decimal("0.00"):
-        budget = (
-            Budget.objects.filter(cost_center=po.cost_center)
-            .order_by("-created_at")
-            .first()
-        )
+        budget = _get_budget_for_po(po)
         if budget:
             available = budget.available_amount
             if available < delta:
@@ -556,6 +582,10 @@ def approve_po_amendment_service(
         )
 
     po = amendment.po
+    if po.status in (PurchaseOrder.STATUS_CANCELLED, PurchaseOrder.STATUS_COMPLETED):
+        raise ValidationError(
+            f"Cannot approve amendment #{amendment.amendment_number}: Purchase Order '{po.po_number}' is in {po.status} status."
+        )
     proposed_changes = amendment.proposed_changes or {}
     proposed_lines = proposed_changes.get("lines", [])
 
@@ -628,13 +658,13 @@ def approve_po_amendment_service(
                 )
             line.delete()
 
-    subtotal_val = Decimal(str(proposed_changes.get("subtotal", subtotal)))
+    subtotal_val = Decimal(str(proposed_changes.get("subtotal", subtotal))).quantize(Decimal("0.01"))
     tax_val = Decimal(
-        str(proposed_changes.get("tax_amount", subtotal * Decimal("0.10")))
-    )
+        str(proposed_changes.get("tax_amount", (subtotal * Decimal("0.10")).quantize(Decimal("0.01"))))
+    ).quantize(Decimal("0.01"))
     total_val = Decimal(
         str(proposed_changes.get("total_amount", subtotal_val + tax_val))
-    )
+    ).quantize(Decimal("0.01"))
     diff = amendment.delta_amount
 
     # Update PO version, values, and reset vendor acknowledgement
@@ -662,11 +692,7 @@ def approve_po_amendment_service(
 
     # Adjust Budget commitment with delta difference
     if diff != Decimal("0.00"):
-        budget = (
-            Budget.objects.filter(cost_center=po.cost_center)
-            .order_by("-created_at")
-            .first()
-        )
+        budget = _get_budget_for_po(po, for_update=True)
         if budget:
             budget.committed_amount = max(
                 Decimal("0.00"), budget.committed_amount + diff
@@ -954,11 +980,7 @@ def cancel_purchase_order_governance_service(
     )
 
     if had_commitment and unfulfilled_commitment > Decimal("0.00"):
-        budget = (
-            Budget.objects.filter(cost_center=po.cost_center)
-            .order_by("-created_at")
-            .first()
-        )
+        budget = _get_budget_for_po(po, for_update=True)
         if budget:
             budget.committed_amount = max(
                 Decimal("0.00"), budget.committed_amount - unfulfilled_commitment
@@ -1140,11 +1162,7 @@ def approve_purchase_order_service(
         amount__gt=Decimal("0.00"),
     ).exists()
     if not already_committed:
-        budget = (
-            Budget.objects.filter(cost_center=po.cost_center)
-            .order_by("-created_at")
-            .first()
-        )
+        budget = _get_budget_for_po(po, for_update=True)
         if budget:
             budget.committed_amount += po.total_amount
             budget.save(update_fields=["committed_amount", "updated_at"])
@@ -1265,7 +1283,7 @@ def issue_purchase_order_service(
 
     # Record commitment on spend ledger if not already recorded
     from apps.budgets.models import Budget, SpendLedger
-    budget = Budget.objects.filter(cost_center=po.cost_center).order_by("-created_at").first()
+    budget = _get_budget_for_po(po, for_update=True)
     if budget:
         if not SpendLedger.objects.filter(reference_number=po.po_number, entry_type=SpendLedger.ENTRY_COMMITMENT).exists():
             budget.committed_amount += po.total_amount
@@ -1587,10 +1605,10 @@ def update_draft_purchase_order_service(
         line.save(update_fields=["quantity", "unit_price", "line_total", "updated_at"])
         subtotal += line.line_total
 
-    tax = subtotal * tax_rate
-    po.subtotal = subtotal
+    tax = (subtotal * tax_rate).quantize(Decimal("0.01"))
+    po.subtotal = subtotal.quantize(Decimal("0.01"))
     po.tax_amount = tax
-    po.total_amount = subtotal + tax
+    po.total_amount = (subtotal + tax).quantize(Decimal("0.01"))
     po.save(
         update_fields=["subtotal", "tax_amount", "total_amount", "updated_at"]
     )

@@ -299,6 +299,9 @@ def update_vendor_service(
 
 
     legal_name = validate_legal_name(legal_name)
+    trade_name = validate_no_html_or_script(trade_name, "Trade name")
+    address = validate_no_html_or_script(address, "Address")
+    bank_name = validate_no_html_or_script(bank_name, "Bank name")
     if phone:
         phone = validate_optional_phone_number(phone)
 
@@ -753,6 +756,8 @@ def verify_vendor_document_decision_service(
             raise ValidationError("Either document or document_id is required.")
 
         document = VendorDocument.objects.select_for_update().get(pk=document_id)
+
+    document = _lock_reviewable_document(document, reviewer)
 
 
 
@@ -3253,6 +3258,8 @@ def scan_vendor_document_expirations_service(now=None) -> dict:
 
             previous_status = doc.status
 
+            previous_is_verified = bool(doc.is_verified)
+
             doc.status = VendorDocument.STATUS_EXPIRED
 
             doc.is_verified = False
@@ -3289,7 +3296,7 @@ def scan_vendor_document_expirations_service(now=None) -> dict:
 
                 target_object_id=str(doc.id),
 
-                previous_state={"status": previous_status, "is_verified": True},
+                previous_state={"status": previous_status, "is_verified": previous_is_verified},
 
                 new_state={
 
@@ -3449,7 +3456,7 @@ def scan_vendor_document_expirations_service(now=None) -> dict:
 
                 notification_type=Notification.TYPE_KYC_REQUEST,
 
-                title__contains=f"Renewal Warning ({reminder_days} Days): {doc.title}",
+                title=f"Renewal Warning ({reminder_days} Days): {doc.title}",
 
                 created_at__date=today,
 
@@ -3587,6 +3594,12 @@ def create_vendor_contact_service(
 
         raise ValidationError("First name, last name, and email are required.")
 
+    from django.core.validators import validate_email as dj_validate_email
+    try:
+        dj_validate_email(email)
+    except ValidationError:
+        raise ValidationError(f"Invalid email address '{email}'.")
+
 
 
     if is_primary:
@@ -3710,16 +3723,27 @@ def update_vendor_contact_service(
 
 
     if "first_name" in data:
-
-        contact.first_name = (data["first_name"] or "").strip()
+        fn = (data["first_name"] or "").strip()
+        if not fn:
+            raise ValidationError("First name cannot be blank.")
+        contact.first_name = fn
 
     if "last_name" in data:
-
-        contact.last_name = (data["last_name"] or "").strip()
+        ln = (data["last_name"] or "").strip()
+        if not ln:
+            raise ValidationError("Last name cannot be blank.")
+        contact.last_name = ln
 
     if "email" in data:
-
-        contact.email = (data["email"] or "").strip()
+        em = (data["email"] or "").strip()
+        if not em:
+            raise ValidationError("Email cannot be blank.")
+        from django.core.validators import validate_email as dj_validate_email
+        try:
+            dj_validate_email(em)
+        except ValidationError:
+            raise ValidationError(f"Invalid email address '{em}'.")
+        contact.email = em
 
     if "phone" in data:
 
@@ -4146,6 +4170,19 @@ def bulk_import_vendors_from_csv_service(*, csv_file, target_org, actor=None) ->
 
         gstin = get_val("gstin", "gst")
 
+        norm_pan = normalize_tax_identifier(pan) if pan else ""
+        norm_gstin = normalize_tax_identifier(gstin) if gstin else ""
+        try:
+            if norm_pan:
+                validate_pan_number(norm_pan)
+            if norm_gstin:
+                validate_gstin(norm_gstin)
+            if norm_pan and norm_gstin:
+                validate_pan_gstin_consistency(norm_pan, norm_gstin)
+        except ValidationError as exc:
+            errors.append(f"Row {row_idx}: {exc.messages[0]}")
+            continue
+
 
 
         if not legal_name:
@@ -4228,9 +4265,9 @@ def bulk_import_vendors_from_csv_service(*, csv_file, target_org, actor=None) ->
 
             tax_identification_number=tax_id,
 
-            pan_number=pan,
+            pan_number=norm_pan,
 
-            gstin=gstin,
+            gstin=norm_gstin,
 
             category=category,
 

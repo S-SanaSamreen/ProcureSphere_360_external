@@ -173,7 +173,7 @@ def get_spend_analytics_report(
                 uuid.UUID(cat_val)
                 is_id = True
             except (ValueError, AttributeError):
-                is_id = cat_val.isdigit()
+                is_id = False
 
             if is_id:
                 invoices = invoices.filter(vendor__category_id=cat_val)
@@ -193,7 +193,7 @@ def get_spend_analytics_report(
                 uuid.UUID(dept_val)
                 is_id = True
             except (ValueError, AttributeError):
-                is_id = dept_val.isdigit()
+                is_id = False
 
             if is_id:
                 invoices = invoices.filter(
@@ -218,7 +218,7 @@ def get_spend_analytics_report(
                 uuid.UUID(cc_val)
                 is_id = True
             except (ValueError, AttributeError):
-                is_id = cc_val.isdigit()
+                is_id = False
 
             if is_id:
                 invoices = invoices.filter(po__cost_center_id=cc_val)
@@ -238,7 +238,7 @@ def get_spend_analytics_report(
                 uuid.UUID(vend_val)
                 is_id = True
             except (ValueError, AttributeError):
-                is_id = vend_val.isdigit()
+                is_id = False
 
             if is_id:
                 invoices = invoices.filter(vendor_id=vend_val)
@@ -246,7 +246,6 @@ def get_spend_analytics_report(
                 invoices = invoices.filter(
                     _Q(vendor__legal_name__icontains=vend_val)
                     | _Q(vendor__trade_name__icontains=vend_val)
-                    | _Q(vendor__vendor_code__icontains=vend_val)
                     | _Q(vendor__vendor_number__icontains=vend_val)
                 )
 
@@ -297,7 +296,7 @@ def get_sourcing_cycle_time_report(user=None):
             events = events.none()
     report_data = []
     for e in events:
-        bid_count = e.bids.count()
+        bid_count = e.bids.exclude(status__in=["DRAFT", "WITHDRAWN"]).count()
         invite_count = e.invitations.count()
         start_dt = e.bid_start_date.strftime("%Y-%m-%d") if e.bid_start_date else "N/A"
         end_dt = e.bid_end_date.strftime("%Y-%m-%d") if e.bid_end_date else "N/A"

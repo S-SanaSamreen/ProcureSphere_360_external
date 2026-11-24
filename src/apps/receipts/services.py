@@ -174,6 +174,8 @@ def _check_stores_receiver_permission(
 
 
 def _update_po_completion_status(po: PurchaseOrder) -> None:
+    if po.status == PurchaseOrder.STATUS_CANCELLED:
+        return
     lines = list(POLine.objects.filter(po=po))
     if not lines:
         return
@@ -651,6 +653,22 @@ def _apply_single_line_inspection(
     if hasattr(receipt_line, "stock_handoff"):
         try:
             handoff = receipt_line.stock_handoff
+            old_handed_off = handoff.quantity_handed_off
+            diff = qty_accepted - old_handed_off
+            if diff != Decimal("0.00"):
+                location = handoff.storage_location or "MAIN-WH"
+                stock_item = StockItem.objects.filter(po_line=receipt_line.po_line, location=location).first()
+                if stock_item:
+                    stock_item.quantity_on_hand = max(Decimal("0.00"), stock_item.quantity_on_hand + diff)
+                    stock_item.save(update_fields=["quantity_on_hand", "updated_at"])
+                    StockMovement.objects.create(
+                        stock_item=stock_item,
+                        movement_type=StockMovement.MOVE_OUT if diff < 0 else StockMovement.MOVE_IN,
+                        quantity=abs(diff),
+                        reference_number=receipt.grn_number,
+                        performed_by=inspected_by,
+                        notes=f"Inspection quantity adjustment for {receipt_line.po_line.item_description}",
+                    )
             handoff.quantity_handed_off = qty_accepted
             handoff.save(update_fields=["quantity_handed_off", "updated_at"])
         except StockHandoffRecord.DoesNotExist:
@@ -1037,25 +1055,36 @@ def process_vendor_return_service(
             f"Cannot return line '{receipt_line.po_line.item_description}' with 0 rejected quantity."
         )
 
-    max_returnable = rejection_record.rejected_quantity
-    if return_quantity is not None:
-        return_quantity = Decimal(str(return_quantity))
-        if return_quantity <= Decimal("0.00"):
-            raise ValidationError("Return quantity must be greater than 0.")
-        if return_quantity > max_returnable:
-            raise ValidationError(
-                f"Return quantity ({return_quantity}) cannot exceed rejected quantity ({max_returnable}) for '{receipt_line.po_line.item_description}'."
-            )
-    else:
-        return_quantity = max_returnable
+    import re
 
-    if rejection_record.returned_to_vendor:
+    # Calculate already returned quantity from past dispatches recorded on this rejection record
+    matches = re.findall(
+        r"\[Dispatched return of ([\d.]+) units", rejection_record.rejection_reason or ""
+    )
+    already_returned = sum(Decimal(m) for m in matches) if matches else Decimal("0.00")
+    remaining_returnable = max(Decimal("0.00"), rejection_record.rejected_quantity - already_returned)
+
+    if rejection_record.returned_to_vendor or remaining_returnable <= Decimal("0.00"):
         raise ValidationError(
             f"Rejected goods for line '{receipt_line.po_line.item_description}' have already been returned to vendor."
         )
 
+    if return_quantity is not None:
+        return_quantity = Decimal(str(return_quantity))
+        if return_quantity <= Decimal("0.00"):
+            raise ValidationError("Return quantity must be greater than 0.")
+        if return_quantity > remaining_returnable:
+            raise ValidationError(
+                f"Return quantity ({return_quantity}) cannot exceed remaining returnable quantity ({remaining_returnable}) for '{receipt_line.po_line.item_description}'."
+            )
+    else:
+        return_quantity = remaining_returnable
+
     prev_returned = rejection_record.returned_to_vendor
-    rejection_record.returned_to_vendor = True
+    if already_returned + return_quantity >= rejection_record.rejected_quantity:
+        rejection_record.returned_to_vendor = True
+    else:
+        rejection_record.returned_to_vendor = False
 
     dispatch_info = []
     if tracking_reference:
@@ -1077,7 +1106,7 @@ def process_vendor_return_service(
         target_object_id=str(rejection_record.id),
         previous_state={
             "returned_to_vendor": prev_returned,
-            "rejected_quantity": str(max_returnable),
+            "rejected_quantity": str(rejection_record.rejected_quantity),
             "rejection_reason": rejection_record.rejection_reason,
         },
         new_state={

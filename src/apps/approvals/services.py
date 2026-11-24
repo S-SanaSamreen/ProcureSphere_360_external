@@ -570,6 +570,22 @@ def set_approval_delegate_service(
     """
     Sets up a temporary delegate for an approver.
     """
+    if approver.id == delegate.id:
+        raise ValidationError("Self-delegation is prohibited: An approver cannot delegate to themselves.")
+
+    from datetime import date, datetime
+    s_date = start_date.date() if isinstance(start_date, datetime) else start_date
+    e_date = end_date.date() if isinstance(end_date, datetime) else end_date
+    if isinstance(s_date, str):
+        from django.utils.dateparse import parse_date
+        s_date = parse_date(s_date)
+    if isinstance(e_date, str):
+        from django.utils.dateparse import parse_date
+        e_date = parse_date(e_date)
+
+    if s_date and e_date and e_date < s_date:
+        raise ValidationError("Delegation end date cannot be earlier than start date.")
+
     delegate_record = ApprovalDelegate.objects.create(
         approver=approver,
         delegate=delegate,
@@ -596,6 +612,10 @@ def process_approval_action_service(
     )
 
     act_str = str(action).upper()
+    valid_actions = ["APPROVE", "APPROVED", "REJECT", "REJECTED"]
+    if act_str not in valid_actions:
+        raise ValidationError(f"Invalid approval action '{action}'. Valid actions are APPROVE or REJECT.")
+
     if isinstance(target_object, PurchaseRequisition):
         if act_str in ["APPROVE", "APPROVED"]:
             approve_purchase_requisition_service(

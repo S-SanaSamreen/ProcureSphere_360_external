@@ -6,6 +6,16 @@ from apps.core.models import TimeStampedModel
 from apps.core.validators import validate_pr_attachment
 
 
+class PurchaseRequisitionQuerySet(models.QuerySet):
+    def delete(self):
+        """
+        Hard deletion of PurchaseRequisitions via QuerySet is strictly prohibited (PR-02).
+        Transitions status to CANCELLED instead of destroying records.
+        """
+        count = self.update(status=PurchaseRequisition.STATUS_CANCELLED)
+        return (count, {self.model._meta.label: count})
+
+
 class PurchaseRequisition(TimeStampedModel):
     STATUS_DRAFT = "DRAFT"
     STATUS_SUBMITTED = "SUBMITTED"
@@ -48,6 +58,8 @@ class PurchaseRequisition(TimeStampedModel):
     )
     total_amount = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
     requested_delivery_date = models.DateField()
+
+    objects = PurchaseRequisitionQuerySet.as_manager()
 
     def __str__(self):
         return f"{self.pr_number} - {self.title} (${self.total_amount})"
