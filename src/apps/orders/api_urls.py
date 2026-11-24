@@ -55,10 +55,7 @@ class CanManagePurchaseOrder(BasePermission):
         if role_code == Role.AUDITOR:
             return request.method in SAFE_METHODS
 
-        is_vendor = (
-            getattr(request.user, "is_vendor", False)
-            or role_code == Role.VENDOR_USER
-        )
+        is_vendor = getattr(request.user, "is_vendor", False) or role_code == Role.VENDOR_USER
 
         if is_vendor:
             if request.method in SAFE_METHODS:
@@ -81,13 +78,11 @@ class CanManagePurchaseOrder(BasePermission):
 
 
 class POLineSerializer(serializers.ModelSerializer):
-    remaining_quantity = serializers.DecimalField(
-        max_digits=12, decimal_places=2, read_only=True
-    )
+    remaining_quantity = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
 
     def validate_unit_price(self, value):
-        if value < Decimal("0.00"):
-            raise serializers.ValidationError("Unit price cannot be negative.")
+        if value <= Decimal("0.00"):
+            raise serializers.ValidationError("Unit price must be greater than zero.")
         if value.as_tuple().exponent < -2:
             raise serializers.ValidationError("Unit price cannot have more than 2 decimal places.")
         return value
@@ -113,14 +108,9 @@ class POLineSerializer(serializers.ModelSerializer):
         ]
 
 
-
 class POAmendmentSerializer(serializers.ModelSerializer):
-    requested_by_email = serializers.CharField(
-        source="requested_by.email", read_only=True
-    )
-    approved_by_email = serializers.CharField(
-        source="approved_by.email", read_only=True
-    )
+    requested_by_email = serializers.CharField(source="requested_by.email", read_only=True)
+    approved_by_email = serializers.CharField(source="approved_by.email", read_only=True)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
 
     class Meta:
@@ -145,9 +135,7 @@ class POAmendmentSerializer(serializers.ModelSerializer):
 
 
 class DeliveryScheduleSerializer(serializers.ModelSerializer):
-    line_description = serializers.CharField(
-        source="po_line.item_description", read_only=True
-    )
+    line_description = serializers.CharField(source="po_line.item_description", read_only=True)
 
     class Meta:
         model = DeliverySchedule
@@ -194,27 +182,17 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
     vendor_risk_level = serializers.SerializerMethodField()
 
     cost_center_code = serializers.CharField(source="cost_center.code", read_only=True)
-    department_id = serializers.CharField(
-        source="cost_center.department.id", read_only=True
-    )
-    department_name = serializers.CharField(
-        source="cost_center.department.name", read_only=True
-    )
-    department_code = serializers.CharField(
-        source="cost_center.department.code", read_only=True
-    )
+    department_id = serializers.CharField(source="cost_center.department.id", read_only=True)
+    department_name = serializers.CharField(source="cost_center.department.name", read_only=True)
+    department_code = serializers.CharField(source="cost_center.department.code", read_only=True)
 
     requisition_number = serializers.CharField(
         source="requisition.requisition_number", read_only=True
     )
-    sourcing_title = serializers.CharField(
-        source="sourcing_event.title", read_only=True
-    )
+    sourcing_title = serializers.CharField(source="sourcing_event.title", read_only=True)
 
     status_display = serializers.CharField(source="get_status_display", read_only=True)
-    acknowledged_by_email = serializers.CharField(
-        source="acknowledged_by.email", read_only=True
-    )
+    acknowledged_by_email = serializers.CharField(source="acknowledged_by.email", read_only=True)
     is_acknowledged = serializers.SerializerMethodField()
 
     lines_count = serializers.SerializerMethodField()
@@ -294,24 +272,40 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
         if vendor and vendor.status != Vendor.STATUS_ACTIVE:
             if vendor.status == Vendor.STATUS_SUSPENDED:
                 raise serializers.ValidationError(
-                    {"vendor": [f"Cannot create Purchase Order: Vendor '{vendor.legal_name}' is not ACTIVE (current status: SUSPENDED). POs cannot be issued to suspended vendors."]}
+                    {
+                        "vendor": [
+                            f"Cannot create Purchase Order: Vendor '{vendor.legal_name}' is not ACTIVE (current status: SUSPENDED). POs cannot be issued to suspended vendors."
+                        ]
+                    }
                 )
             raise serializers.ValidationError(
-                {"vendor": [f"Cannot create Purchase Order: Vendor '{vendor.legal_name}' is not ACTIVE (current status: {vendor.status})."]}
+                {
+                    "vendor": [
+                        f"Cannot create Purchase Order: Vendor '{vendor.legal_name}' is not ACTIVE (current status: {vendor.status})."
+                    ]
+                }
             )
 
         # A PO can only be created from an APPROVED requisition
         requisition = attrs.get("requisition", getattr(self.instance, "requisition", None))
         if requisition and requisition.status not in ("APPROVED", "SOURCING"):
             raise serializers.ValidationError(
-                {"requisition": [f"Cannot create Purchase Order from requisition '{requisition.pr_number}': Requisition status is '{requisition.status}' (must be APPROVED)."]}
+                {
+                    "requisition": [
+                        f"Cannot create Purchase Order from requisition '{requisition.pr_number}': Requisition status is '{requisition.status}' (must be APPROVED)."
+                    ]
+                }
             )
 
         # A PO can only be created from an AWARDED sourcing event
         sourcing_event = attrs.get("sourcing_event", getattr(self.instance, "sourcing_event", None))
         if sourcing_event and sourcing_event.status != SourcingEvent.STATUS_AWARDED:
             raise serializers.ValidationError(
-                {"sourcing_event": [f"Cannot create Purchase Order from sourcing event '{sourcing_event.event_number}': Sourcing event status is '{sourcing_event.status}' (must be AWARDED)."]}
+                {
+                    "sourcing_event": [
+                        f"Cannot create Purchase Order from sourcing event '{sourcing_event.event_number}': Sourcing event status is '{sourcing_event.status}' (must be AWARDED)."
+                    ]
+                }
             )
 
         po_num = attrs.get("po_number") or self.initial_data.get("po_number")
@@ -344,11 +338,19 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
                             d_price = Decimal(str(price))
                             if d_price < Decimal("0.00"):
                                 raise serializers.ValidationError(
-                                    {"lines": [f"Unit price cannot be negative for line item {idx + 1}."]}
+                                    {
+                                        "lines": [
+                                            f"Unit price cannot be negative for line item {idx + 1}."
+                                        ]
+                                    }
                                 )
                             if d_price.as_tuple().exponent < -2:
                                 raise serializers.ValidationError(
-                                    {"lines": [f"Unit price cannot have more than 2 decimal places for line item {idx + 1}."]}
+                                    {
+                                        "lines": [
+                                            f"Unit price cannot have more than 2 decimal places for line item {idx + 1}."
+                                        ]
+                                    }
                                 )
                         except (TypeError, ValueError, ArithmeticError) as e:
                             if isinstance(e, serializers.ValidationError):
@@ -361,14 +363,17 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
                         try:
                             if Decimal(str(qty)) <= Decimal("0.00"):
                                 raise serializers.ValidationError(
-                                    {"lines": [f"Quantity must be greater than zero for line item {idx + 1}."]}
+                                    {
+                                        "lines": [
+                                            f"Quantity must be greater than zero for line item {idx + 1}."
+                                        ]
+                                    }
                                 )
                         except (TypeError, ValueError, ArithmeticError):
                             raise serializers.ValidationError(
                                 {"lines": [f"Invalid quantity for line item {idx + 1}."]}
                             )
         return attrs
-
 
     def create(self, validated_data):
         from django.db import transaction
@@ -405,9 +410,7 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
         return latest_risk.risk_level if latest_risk else "LOW"
 
     def get_is_acknowledged(self, obj):
-        return bool(
-            obj.acknowledged_at or obj.status == PurchaseOrder.STATUS_ACKNOWLEDGED
-        )
+        return bool(obj.acknowledged_at or obj.status == PurchaseOrder.STATUS_ACKNOWLEDGED)
 
     def get_lines_count(self, obj):
         return obj.lines.count()
@@ -488,8 +491,34 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
     ]
     ordering_fields = ["created_at", "total_amount", "po_number", "version", "status"]
 
+    def perform_create(self, serializer):
+        po = serializer.save()
+        from apps.audit.models import AuditLog
+        from apps.audit.services import create_audit_log_service
+
+        actor = (
+            self.request.user
+            if getattr(self.request, "user", None) and self.request.user.is_authenticated
+            else None
+        )
+        create_audit_log_service(
+            actor=actor,
+            action=AuditLog.ACTION_CREATE,
+            target_model="PurchaseOrder",
+            target_object_id=str(po.id),
+            new_state={
+                "po_number": po.po_number,
+                "version": po.version,
+                "total_amount": str(po.total_amount),
+                "vendor": po.vendor.legal_name if po.vendor else "",
+                "status": po.status,
+            },
+            request=self.request,
+        )
+
     def create(self, request, *args, **kwargs):
         from django.db import IntegrityError, transaction
+
         try:
             with transaction.atomic():
                 return super().create(request, *args, **kwargs)
@@ -501,7 +530,9 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                         "error": {
                             "code": "DUPLICATE_RESOURCE",
                             "message": "A Purchase Order with this PO number already exists or concurrent creation collided. Please retry.",
-                            "details": {"po_number": ["Purchase Order with this PO number already exists."]},
+                            "details": {
+                                "po_number": ["Purchase Order with this PO number already exists."]
+                            },
                         }
                     },
                     status=status.HTTP_409_CONFLICT,
@@ -537,13 +568,10 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             qs = qs.filter(status=status_param)
 
         # Filter by acknowledgement_status query param
-        ack_param = (
-            self.request.query_params.get("acknowledgement_status", "").strip().lower()
-        )
+        ack_param = self.request.query_params.get("acknowledgement_status", "").strip().lower()
         if ack_param == "acknowledged":
             qs = qs.filter(
-                Q(acknowledged_at__isnull=False)
-                | Q(status=PurchaseOrder.STATUS_ACKNOWLEDGED)
+                Q(acknowledged_at__isnull=False) | Q(status=PurchaseOrder.STATUS_ACKNOWLEDGED)
             )
         elif ack_param == "pending":
             qs = qs.filter(
@@ -574,9 +602,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             )
 
         # Filter by has_amendments query param
-        has_amendments = (
-            self.request.query_params.get("has_amendments", "").strip().lower()
-        )
+        has_amendments = self.request.query_params.get("has_amendments", "").strip().lower()
         if has_amendments in ["true", "1", "yes"]:
             qs = qs.filter(amendments__isnull=False).distinct()
         elif has_amendments in ["false", "0", "no"]:
@@ -614,12 +640,10 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         total_value_data = qs.aggregate(total=Sum("total_amount"))
         total_po_value = float(total_value_data["total"] or Decimal("0.00"))
 
-        status_counts = dict(qs.values_list("status").annotate(count=Count("id")))
+        status_counts = dict(qs.order_by().values_list("status").annotate(count=Count("id")))
         issued_count = status_counts.get(PurchaseOrder.STATUS_ISSUED, 0)
         acknowledged_count = status_counts.get(PurchaseOrder.STATUS_ACKNOWLEDGED, 0)
-        partial_receipt_count = status_counts.get(
-            PurchaseOrder.STATUS_PARTIAL_RECEIPT, 0
-        )
+        partial_receipt_count = status_counts.get(PurchaseOrder.STATUS_PARTIAL_RECEIPT, 0)
         completed_count = status_counts.get(PurchaseOrder.STATUS_COMPLETED, 0)
         cancelled_count = status_counts.get(PurchaseOrder.STATUS_CANCELLED, 0)
         draft_count = status_counts.get(PurchaseOrder.STATUS_DRAFT, 0)
@@ -638,9 +662,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 PurchaseOrder.STATUS_PARTIAL_RECEIPT,
             ]
         ).aggregate(total=Sum("total_amount"))
-        active_commitments_value = float(
-            active_commitments_data["total"] or Decimal("0.00")
-        )
+        active_commitments_value = float(active_commitments_data["total"] or Decimal("0.00"))
 
         # Amended orders count
         amended_orders_count = qs.filter(amendments__isnull=False).distinct().count()
@@ -675,9 +697,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         Manager governance action to cancel a PO and release remaining budget commitment.
         """
         po = self.get_object()
-        reason = str(
-            request.data.get("reason", request.data.get("justification", ""))
-        ).strip()
+        reason = str(request.data.get("reason", request.data.get("justification", ""))).strip()
 
         if not reason:
             return Response(
@@ -723,14 +743,22 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         instance = self.get_object()
         if instance.status != PurchaseOrder.STATUS_DRAFT:
             raise serializers.ValidationError(
-                {"status": [f"Purchase orders in '{instance.status}' status cannot be edited directly. Use /amend/ to propose changes."]}
+                {
+                    "status": [
+                        f"Purchase orders in '{instance.status}' status cannot be edited directly. Use /amend/ to propose changes."
+                    ]
+                }
             )
         serializer.save()
 
     def perform_destroy(self, instance):
         if instance.status != PurchaseOrder.STATUS_DRAFT:
             raise serializers.ValidationError(
-                {"status": [f"Purchase orders in '{instance.status}' status cannot be deleted. Use /governance-cancel/ to cancel."]}
+                {
+                    "status": [
+                        f"Purchase orders in '{instance.status}' status cannot be deleted. Use /governance-cancel/ to cancel."
+                    ]
+                }
             )
         instance.delete()
 
@@ -786,6 +814,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
     def _run_lifecycle_action(self, fn, *args, **kwargs):
         from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
         from rest_framework.exceptions import PermissionDenied as DRFPermissionDenied
+
         try:
             po = fn(*args, **kwargs)
         except (DjangoPermissionDenied, DRFPermissionDenied) as e:
@@ -847,9 +876,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         """APPROVED -> ISSUED. Notifies the vendor and requester."""
         base_qs = scope_purchase_orders_queryset(self.queryset, request.user)
         po = get_object_or_404(base_qs, pk=pk)
-        return self._run_lifecycle_action(
-            issue_purchase_order_service, po=po, actor=request.user
-        )
+        return self._run_lifecycle_action(issue_purchase_order_service, po=po, actor=request.user)
 
     @action(detail=True, methods=["post"], url_path="request-changes")
     def request_changes(self, request, pk=None):
@@ -887,15 +914,32 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="acknowledge")
     def acknowledge(self, request, pk=None):
         po = self.get_object()
-        is_vendor = getattr(request.user, "is_vendor", False) or getattr(request.user, "role_code", None) == Role.VENDOR_USER
+        is_vendor = (
+            getattr(request.user, "is_vendor", False)
+            or getattr(request.user, "role_code", None) == Role.VENDOR_USER
+        )
         if not is_vendor and not request.user.is_superuser:
             return Response(
-                {"error": {"code": "PERMISSION_DENIED", "message": "Only the assigned vendor user can acknowledge this purchase order."}},
+                {
+                    "error": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "Only the assigned vendor user can acknowledge this purchase order.",
+                    }
+                },
                 status=status.HTTP_403_FORBIDDEN,
             )
-        if is_vendor and getattr(request.user, "vendor_id", None) != po.vendor_id and not request.user.is_superuser:
+        if (
+            is_vendor
+            and getattr(request.user, "vendor_id", None) != po.vendor_id
+            and not request.user.is_superuser
+        ):
             return Response(
-                {"error": {"code": "PERMISSION_DENIED", "message": "You can only acknowledge purchase orders issued to your vendor."}},
+                {
+                    "error": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "You can only acknowledge purchase orders issued to your vendor.",
+                    }
+                },
                 status=status.HTTP_403_FORBIDDEN,
             )
         notes = request.data.get("acknowledgement_notes", request.data.get("notes", ""))
@@ -903,9 +947,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             updated_po = acknowledge_purchase_order_service(
                 po=po, vendor_user=request.user, acknowledgement_notes=notes
             )
-            return Response(
-                self.get_serializer(updated_po).data, status=status.HTTP_200_OK
-            )
+            return Response(self.get_serializer(updated_po).data, status=status.HTTP_200_OK)
         except ValidationError as e:
             msg = e.messages if hasattr(e, "messages") else [str(e)]
             return Response(
@@ -921,7 +963,11 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="amend")
     def amend(self, request, pk=None):
         po = self.get_object()
-        if po.status in [PurchaseOrder.STATUS_CANCELLED, PurchaseOrder.STATUS_COMPLETED, PurchaseOrder.STATUS_DRAFT]:
+        if po.status in [
+            PurchaseOrder.STATUS_CANCELLED,
+            PurchaseOrder.STATUS_COMPLETED,
+            PurchaseOrder.STATUS_DRAFT,
+        ]:
             return Response(
                 {
                     "error": {
@@ -947,21 +993,62 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         if raw_lines and isinstance(raw_lines, list):
             for idx, line in enumerate(raw_lines):
                 if not isinstance(line, dict):
-                    return Response({"error": {"code": "VALIDATION_ERROR", "message": f"Line {idx+1} must be an object."}}, status=status.HTTP_400_BAD_REQUEST)
+                    return Response(
+                        {
+                            "error": {
+                                "code": "VALIDATION_ERROR",
+                                "message": f"Line {idx+1} must be an object.",
+                            }
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
                 if not line.get("item_description"):
-                    return Response({"error": {"code": "VALIDATION_ERROR", "message": f"Line {idx+1} is missing item_description."}}, status=status.HTTP_400_BAD_REQUEST)
+                    return Response(
+                        {
+                            "error": {
+                                "code": "VALIDATION_ERROR",
+                                "message": f"Line {idx+1} is missing item_description.",
+                            }
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
                 qty = line.get("quantity")
                 price = line.get("unit_price")
                 try:
                     from decimal import Decimal, InvalidOperation
+
                     d_qty = Decimal(str(qty))
                     d_price = Decimal(str(price))
                     if d_qty <= 0:
-                        return Response({"error": {"code": "VALIDATION_ERROR", "message": f"Line {idx+1} quantity must be greater than zero."}}, status=status.HTTP_400_BAD_REQUEST)
+                        return Response(
+                            {
+                                "error": {
+                                    "code": "VALIDATION_ERROR",
+                                    "message": f"Line {idx+1} quantity must be greater than zero.",
+                                }
+                            },
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
                     if d_price < 0:
-                        return Response({"error": {"code": "VALIDATION_ERROR", "message": f"Line {idx+1} unit price cannot be negative."}}, status=status.HTTP_400_BAD_REQUEST)
+                        return Response(
+                            {
+                                "error": {
+                                    "code": "VALIDATION_ERROR",
+                                    "message": f"Line {idx+1} unit price cannot be negative.",
+                                }
+                            },
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
                 except (InvalidOperation, TypeError, ValueError):
-                    return Response({"error": {"code": "VALIDATION_ERROR", "message": f"Line {idx+1} has invalid quantity or unit price."}}, status=status.HTTP_400_BAD_REQUEST)
+                    return Response(
+                        {
+                            "error": {
+                                "code": "VALIDATION_ERROR",
+                                "message": f"Line {idx+1} has invalid quantity or unit price.",
+                            }
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
             lines = raw_lines
         else:
             lines = [

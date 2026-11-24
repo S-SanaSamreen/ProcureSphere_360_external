@@ -18,7 +18,9 @@ class OrganizationSerializer(serializers.ModelSerializer):
         if self.instance:
             qs = qs.exclude(pk=self.instance.pk)
         if qs.exists():
-            raise serializers.ValidationError("An organization with this code already exists (case-insensitive).")
+            raise serializers.ValidationError(
+                "An organization with this code already exists (case-insensitive)."
+            )
         return val
 
 
@@ -36,7 +38,9 @@ class DepartmentSerializer(serializers.ModelSerializer):
             if self.instance:
                 qs = qs.exclude(pk=self.instance.pk)
             if qs.exists():
-                raise serializers.ValidationError({"code": "A department with this code already exists in this organization."})
+                raise serializers.ValidationError(
+                    {"code": "A department with this code already exists in this organization."}
+                )
         return attrs
 
 
@@ -54,7 +58,9 @@ class CostCenterSerializer(serializers.ModelSerializer):
             if self.instance:
                 qs = qs.exclude(pk=self.instance.pk)
             if qs.exists():
-                raise serializers.ValidationError({"code": "A cost center with this code already exists in this department."})
+                raise serializers.ValidationError(
+                    {"code": "A cost center with this code already exists in this department."}
+                )
         return attrs
 
 
@@ -65,15 +71,12 @@ class IsAdminOrReadOnly(BasePermission):
         role_code = getattr(request.user, "role_code", None) or (
             request.user.role.code if getattr(request.user, "role", None) else None
         )
-        if (
-            getattr(request.user, "is_vendor", False)
-            or role_code in [Role.VENDOR_USER, "VENDOR_USER"]
-        ):
+        if getattr(request.user, "is_vendor", False) or role_code in [
+            Role.VENDOR_USER,
+            "VENDOR_USER",
+        ]:
             return False
-        if (
-            request.user.is_superuser
-            or role_code in [Role.SUPER_ADMIN, "SUPER_ADMIN"]
-        ):
+        if request.user.is_superuser or role_code in [Role.SUPER_ADMIN, "SUPER_ADMIN"]:
             return True
         return request.method in SAFE_METHODS
 
@@ -89,13 +92,22 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         instance = serializer.save()
         from apps.audit.models import AuditLog
         from apps.audit.services import create_audit_log_service
-        actor = self.request.user if getattr(self.request, "user", None) and self.request.user.is_authenticated else None
+
+        actor = (
+            self.request.user
+            if getattr(self.request, "user", None) and self.request.user.is_authenticated
+            else None
+        )
         create_audit_log_service(
             actor=actor,
             action=AuditLog.ACTION_CREATE,
             target_model="Organization",
             target_object_id=str(instance.id),
-            new_state={"name": instance.name, "code": instance.code, "is_active": instance.is_active},
+            new_state={
+                "name": instance.name,
+                "code": instance.code,
+                "is_active": instance.is_active,
+            },
             request=self.request,
         )
 
@@ -103,13 +115,22 @@ class OrganizationViewSet(viewsets.ModelViewSet):
         instance = serializer.save()
         from apps.audit.models import AuditLog
         from apps.audit.services import create_audit_log_service
-        actor = self.request.user if getattr(self.request, "user", None) and self.request.user.is_authenticated else None
+
+        actor = (
+            self.request.user
+            if getattr(self.request, "user", None) and self.request.user.is_authenticated
+            else None
+        )
         create_audit_log_service(
             actor=actor,
             action=AuditLog.ACTION_UPDATE,
             target_model="Organization",
             target_object_id=str(instance.id),
-            new_state={"name": instance.name, "code": instance.code, "is_active": instance.is_active},
+            new_state={
+                "name": instance.name,
+                "code": instance.code,
+                "is_active": instance.is_active,
+            },
             request=self.request,
         )
 
@@ -120,11 +141,18 @@ class OrganizationViewSet(viewsets.ModelViewSet):
             )
         if hasattr(instance, "users") and instance.users.exists():
             raise serializers.ValidationError(
-                {"detail": "Cannot delete organization: active users are assigned to this organization."}
+                {
+                    "detail": "Cannot delete organization: active users are assigned to this organization."
+                }
             )
         from apps.audit.models import AuditLog
         from apps.audit.services import create_audit_log_service
-        actor = self.request.user if getattr(self.request, "user", None) and self.request.user.is_authenticated else None
+
+        actor = (
+            self.request.user
+            if getattr(self.request, "user", None) and self.request.user.is_authenticated
+            else None
+        )
         create_audit_log_service(
             actor=actor,
             action=AuditLog.ACTION_DELETE,
@@ -143,6 +171,59 @@ class DepartmentViewSet(viewsets.ModelViewSet):
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ["name", "code"]
 
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        from apps.audit.models import AuditLog
+        from apps.audit.services import create_audit_log_service
+
+        actor = (
+            self.request.user
+            if getattr(self.request, "user", None) and self.request.user.is_authenticated
+            else None
+        )
+        create_audit_log_service(
+            actor=actor,
+            action=AuditLog.ACTION_CREATE,
+            target_model="Department",
+            target_object_id=str(instance.id),
+            new_state={
+                "name": instance.name,
+                "code": instance.code,
+                "organization": str(instance.organization_id) if instance.organization_id else None,
+            },
+            request=self.request,
+        )
+
+    def perform_update(self, serializer):
+        old_inst = self.get_object()
+        old_state = {
+            "name": old_inst.name,
+            "code": old_inst.code,
+            "organization": str(old_inst.organization_id) if old_inst.organization_id else None,
+        }
+        instance = serializer.save()
+        from apps.audit.models import AuditLog
+        from apps.audit.services import create_audit_log_service
+
+        actor = (
+            self.request.user
+            if getattr(self.request, "user", None) and self.request.user.is_authenticated
+            else None
+        )
+        create_audit_log_service(
+            actor=actor,
+            action=AuditLog.ACTION_UPDATE,
+            target_model="Department",
+            target_object_id=str(instance.id),
+            previous_state=old_state,
+            new_state={
+                "name": instance.name,
+                "code": instance.code,
+                "organization": str(instance.organization_id) if instance.organization_id else None,
+            },
+            request=self.request,
+        )
+
     def perform_destroy(self, instance):
         if hasattr(instance, "cost_centers") and instance.cost_centers.exists():
             raise serializers.ValidationError(
@@ -150,13 +231,33 @@ class DepartmentViewSet(viewsets.ModelViewSet):
             )
         if hasattr(instance, "users") and instance.users.exists():
             raise serializers.ValidationError(
-                {"detail": "Cannot delete department: active users are assigned to this department."}
+                {
+                    "detail": "Cannot delete department: active users are assigned to this department."
+                }
             )
+        from apps.audit.models import AuditLog
+        from apps.audit.services import create_audit_log_service
+
+        actor = (
+            self.request.user
+            if getattr(self.request, "user", None) and self.request.user.is_authenticated
+            else None
+        )
+        create_audit_log_service(
+            actor=actor,
+            action=AuditLog.ACTION_DELETE,
+            target_model="Department",
+            target_object_id=str(instance.id),
+            previous_state={"name": instance.name, "code": instance.code},
+            request=self.request,
+        )
         instance.delete()
 
     def get_queryset(self):
         qs = super().get_queryset()
-        org_param = self.request.query_params.get("organization") or self.request.query_params.get("organization_id")
+        org_param = self.request.query_params.get("organization") or self.request.query_params.get(
+            "organization_id"
+        )
         if org_param:
             qs = qs.filter(organization_id=org_param)
         return qs
@@ -169,11 +270,80 @@ class CostCenterViewSet(viewsets.ModelViewSet):
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ["name", "code"]
 
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        from apps.audit.models import AuditLog
+        from apps.audit.services import create_audit_log_service
+
+        actor = (
+            self.request.user
+            if getattr(self.request, "user", None) and self.request.user.is_authenticated
+            else None
+        )
+        create_audit_log_service(
+            actor=actor,
+            action=AuditLog.ACTION_CREATE,
+            target_model="CostCenter",
+            target_object_id=str(instance.id),
+            new_state={
+                "name": instance.name,
+                "code": instance.code,
+                "department": str(instance.department_id) if instance.department_id else None,
+            },
+            request=self.request,
+        )
+
+    def perform_update(self, serializer):
+        old_inst = self.get_object()
+        old_state = {
+            "name": old_inst.name,
+            "code": old_inst.code,
+            "department": str(old_inst.department_id) if old_inst.department_id else None,
+        }
+        instance = serializer.save()
+        from apps.audit.models import AuditLog
+        from apps.audit.services import create_audit_log_service
+
+        actor = (
+            self.request.user
+            if getattr(self.request, "user", None) and self.request.user.is_authenticated
+            else None
+        )
+        create_audit_log_service(
+            actor=actor,
+            action=AuditLog.ACTION_UPDATE,
+            target_model="CostCenter",
+            target_object_id=str(instance.id),
+            previous_state=old_state,
+            new_state={
+                "name": instance.name,
+                "code": instance.code,
+                "department": str(instance.department_id) if instance.department_id else None,
+            },
+            request=self.request,
+        )
+
     def perform_destroy(self, instance):
         if hasattr(instance, "budgets") and instance.budgets.exists():
             raise serializers.ValidationError(
                 {"detail": "Cannot delete cost center: financial budget records exist."}
             )
+        from apps.audit.models import AuditLog
+        from apps.audit.services import create_audit_log_service
+
+        actor = (
+            self.request.user
+            if getattr(self.request, "user", None) and self.request.user.is_authenticated
+            else None
+        )
+        create_audit_log_service(
+            actor=actor,
+            action=AuditLog.ACTION_DELETE,
+            target_model="CostCenter",
+            target_object_id=str(instance.id),
+            previous_state={"name": instance.name, "code": instance.code},
+            request=self.request,
+        )
         instance.delete()
 
     def get_queryset(self):
@@ -182,7 +352,9 @@ class CostCenterViewSet(viewsets.ModelViewSet):
         if not user or not user.is_authenticated:
             return qs.none()
 
-        department_param = self.request.query_params.get("department") or self.request.query_params.get("department_id")
+        department_param = self.request.query_params.get(
+            "department"
+        ) or self.request.query_params.get("department_id")
         if department_param:
             qs = qs.filter(department_id=department_param)
 

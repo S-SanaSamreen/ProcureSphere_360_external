@@ -163,9 +163,7 @@ def compute_sla_metrics(vendor):
             "notes": "All due vendor-owned contract obligations, on-time fulfilment share.",
         }
     )
-    for (metric_code, contract_id), bucket in sorted(
-        buckets.items(), key=lambda item: item[0][1]
-    ):
+    for (metric_code, contract_id), bucket in sorted(buckets.items(), key=lambda item: item[0][1]):
         actual = _pct(bucket["met"], bucket["observations"])
         rows.append(
             {
@@ -215,22 +213,37 @@ def calculate_vendor_scorecard_service(
     sla_rows = compute_sla_metrics(vendor)
 
     with transaction.atomic():
-        scorecard = VendorScorecard.objects.create(
-            vendor=vendor,
-            evaluation_period=evaluation_period,
-            delivery_score=compute_delivery_score(vendor),
-            quality_score=compute_quality_score(vendor),
-            price_score=compute_price_score(vendor),
-            responsiveness_score=compute_responsiveness_score(vendor),
-            compliance_score=compute_compliance_score(vendor),
-            sla_score=sla_rows[0]["actual_pct"] if sla_rows else None,
-            evaluator_comments=comments
-            or f"Automated performance evaluation for period {evaluation_period}",
-            evaluated_by=evaluated_by_user,
-            created_by=evaluated_by_user,
-        )
+        scorecard = VendorScorecard.objects.filter(
+            vendor=vendor, evaluation_period__iexact=evaluation_period
+        ).first()
+        is_created = False
+        if not scorecard:
+            scorecard = VendorScorecard(
+                vendor=vendor,
+                evaluation_period=evaluation_period,
+                created_by=evaluated_by_user,
+            )
+            is_created = True
+
+        scorecard.delivery_score = compute_delivery_score(vendor)
+        scorecard.quality_score = compute_quality_score(vendor)
+        scorecard.price_score = compute_price_score(vendor)
+        scorecard.responsiveness_score = compute_responsiveness_score(vendor)
+        scorecard.compliance_score = compute_compliance_score(vendor)
+        scorecard.sla_score = sla_rows[0]["actual_pct"] if sla_rows else None
+        if comments:
+            scorecard.evaluator_comments = comments
+        elif is_created:
+            scorecard.evaluator_comments = (
+                f"Automated performance evaluation for period {evaluation_period}"
+            )
+        scorecard.evaluated_by = evaluated_by_user
+        scorecard.save()
+        scorecard._was_created = is_created
+
         from .models import VendorScorecardSLAMetric
 
+        scorecard.sla_metrics.all().delete()
         for row in sla_rows:
             VendorScorecardSLAMetric.objects.create(
                 scorecard=scorecard,
@@ -249,7 +262,7 @@ def calculate_vendor_scorecard_service(
 
     create_audit_log_service(
         actor=evaluated_by_user,
-        action=AuditLog.ACTION_CREATE,
+        action=AuditLog.ACTION_CREATE if is_created else AuditLog.ACTION_UPDATE,
         target_model="VendorScorecard",
         target_object_id=scorecard.id,
         new_state={

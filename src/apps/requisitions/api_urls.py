@@ -58,9 +58,9 @@ class PRLineSerializer(serializers.ModelSerializer):
                 )
         if attrs.get("estimated_unit_price") is not None and attrs[
             "estimated_unit_price"
-        ] < Decimal("0.00"):
+        ] <= Decimal("0.00"):
             raise serializers.ValidationError(
-                {"estimated_unit_price": "Estimated unit price cannot be negative."}
+                {"estimated_unit_price": "Estimated unit price must be greater than zero."}
             )
         return attrs
 
@@ -459,7 +459,8 @@ class CanCreateRequisitionPermission(permissions.BasePermission):
         )
 
         if not request.user.is_superuser and (
-            getattr(request.user, "is_vendor", False) or role_code in [Role.VENDOR_USER]
+            getattr(request.user, "is_vendor", False)
+            or role_code in [Role.VENDOR_USER, Role.STORES_RECEIVER, Role.LEGAL_MGR]
         ):
             return False
 
