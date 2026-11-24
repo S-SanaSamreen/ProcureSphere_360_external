@@ -72,7 +72,9 @@ class PRAttachmentSerializer(serializers.ModelSerializer):
 
 
 class RequisitionApproveSerializer(serializers.Serializer):
-    comments = serializers.CharField(required=False, allow_blank=True, default="", help_text="Approval or rejection notes.")
+    comments = serializers.CharField(
+        required=False, allow_blank=True, default="", help_text="Approval or rejection notes."
+    )
 
 
 class PurchaseRequisitionSerializer(serializers.ModelSerializer):
@@ -134,14 +136,16 @@ class PurchaseRequisitionSerializer(serializers.ModelSerializer):
                     if (role_obj and role_obj.code == Role.FINANCE_AP)
                     else (role_obj.name if role_obj else "")
                 )
-                steps.append({
-                    "step_number": s["step_number"],
-                    "role": role_name,
-                    "role_code": role_obj.code if role_obj else "",
-                    "description": s.get("description", ""),
-                    "approver": spec_approver.email if spec_approver else None,
-                    "is_mandatory": s.get("is_mandatory", True),
-                })
+                steps.append(
+                    {
+                        "step_number": s["step_number"],
+                        "role": role_name,
+                        "role_code": role_obj.code if role_obj else "",
+                        "description": s.get("description", ""),
+                        "approver": spec_approver.email if spec_approver else None,
+                        "is_mandatory": s.get("is_mandatory", True),
+                    }
+                )
             res = {"steps": steps}
             if cache is not None:
                 cache[cache_key] = res
@@ -168,9 +172,16 @@ class PurchaseRequisitionSerializer(serializers.ModelSerializer):
 
     def validate_department(self, value):
         request = self.context.get("request")
-        if request and request.user and request.user.is_authenticated and not request.user.is_superuser:
+        if (
+            request
+            and request.user
+            and request.user.is_authenticated
+            and not request.user.is_superuser
+        ):
             role_code = getattr(request.user, "role_code", None) or (
-                request.user.role.code if hasattr(request.user, "role") and request.user.role else None
+                request.user.role.code
+                if hasattr(request.user, "role") and request.user.role
+                else None
             )
             if role_code == Role.REQUESTER and getattr(request.user, "department_id", None):
                 if value.id != request.user.department_id:
@@ -199,19 +210,39 @@ class PurchaseRequisitionSerializer(serializers.ModelSerializer):
             if getattr(user, "department_id", None) and cost_center:
                 if cost_center.department_id != user.department_id:
                     from rest_framework.exceptions import PermissionDenied
+
                     raise PermissionDenied(
-                        {"code": "forbidden", "fields": {"cost_center": ["Cost center not authorized for this requester."]}}
+                        {
+                            "code": "forbidden",
+                            "fields": {
+                                "cost_center": ["Cost center not authorized for this requester."]
+                            },
+                        }
                     )
 
         # Organization / Tenant isolation check
-        if request and request.user and request.user.is_authenticated and not request.user.is_superuser:
-            user_org = getattr(request.user, "organization", None) or getattr(request.user, "effective_organization", None)
+        if (
+            request
+            and request.user
+            and request.user.is_authenticated
+            and not request.user.is_superuser
+        ):
+            user_org = getattr(request.user, "organization", None) or getattr(
+                request.user, "effective_organization", None
+            )
             if user_org:
-                if getattr(department, "organization_id", None) and department.organization_id != user_org.id:
+                if (
+                    getattr(department, "organization_id", None)
+                    and department.organization_id != user_org.id
+                ):
                     raise serializers.ValidationError(
                         {"department": ["Department does not belong to your organization."]}
                     )
-                if cost_center.department and getattr(cost_center.department, "organization_id", None) and cost_center.department.organization_id != user_org.id:
+                if (
+                    cost_center.department
+                    and getattr(cost_center.department, "organization_id", None)
+                    and cost_center.department.organization_id != user_org.id
+                ):
                     raise serializers.ValidationError(
                         {"cost_center": ["Cost center does not belong to your organization."]}
                     )
@@ -219,10 +250,16 @@ class PurchaseRequisitionSerializer(serializers.ModelSerializer):
         lines_data = self.initial_data.get("line_items", self.initial_data.get("lines"))
         if self.instance is None:
             if lines_data is None or not isinstance(lines_data, list) or len(lines_data) == 0:
-                raise serializers.ValidationError({"lines": ["A requisition must contain at least one line item."]})
+                raise serializers.ValidationError(
+                    {"lines": ["A requisition must contain at least one line item."]}
+                )
         else:
-            if lines_data is not None and (not isinstance(lines_data, list) or len(lines_data) == 0):
-                raise serializers.ValidationError({"lines": ["A requisition must contain at least one line item."]})
+            if lines_data is not None and (
+                not isinstance(lines_data, list) or len(lines_data) == 0
+            ):
+                raise serializers.ValidationError(
+                    {"lines": ["A requisition must contain at least one line item."]}
+                )
 
         if lines_data and isinstance(lines_data, list):
             for idx, item in enumerate(lines_data):
@@ -241,11 +278,19 @@ class PurchaseRequisitionSerializer(serializers.ModelSerializer):
                         d_qty = Decimal(str(qty))
                         if d_qty <= Decimal("0.00"):
                             raise serializers.ValidationError(
-                                {"lines": [f"Quantity must be greater than zero for line item {idx + 1}."]}
+                                {
+                                    "lines": [
+                                        f"Quantity must be greater than zero for line item {idx + 1}."
+                                    ]
+                                }
                             )
                         if d_qty % 1 != 0:
                             raise serializers.ValidationError(
-                                {"lines": [f"Quantity must be a whole number (no decimal points allowed) for line item {idx + 1}."]}
+                                {
+                                    "lines": [
+                                        f"Quantity must be a whole number (no decimal points allowed) for line item {idx + 1}."
+                                    ]
+                                }
                             )
                     except (TypeError, ValueError, ArithmeticError) as e:
                         if isinstance(e, serializers.ValidationError):
@@ -253,13 +298,21 @@ class PurchaseRequisitionSerializer(serializers.ModelSerializer):
                         raise serializers.ValidationError(
                             {"lines": [f"Invalid quantity for line item {idx + 1}."]}
                         )
-                price = item.get("estimated_unit_price") if item.get("estimated_unit_price") is not None else item.get("unit_price")
+                price = (
+                    item.get("estimated_unit_price")
+                    if item.get("estimated_unit_price") is not None
+                    else item.get("unit_price")
+                )
                 if price is not None:
                     try:
                         d_price = Decimal(str(price))
                         if d_price < Decimal("0.00"):
                             raise serializers.ValidationError(
-                                {"lines": [f"Estimated unit price cannot be negative for line item {idx + 1}."]}
+                                {
+                                    "lines": [
+                                        f"Estimated unit price cannot be negative for line item {idx + 1}."
+                                    ]
+                                }
                             )
                     except (TypeError, ValueError, ArithmeticError):
                         raise serializers.ValidationError(
@@ -274,7 +327,9 @@ class PurchaseRequisitionSerializer(serializers.ModelSerializer):
         with transaction.atomic():
             lines_data = self.initial_data.get("line_items", self.initial_data.get("lines", []))
             if not lines_data:
-                raise serializers.ValidationError({"lines": ["At least one line item is required."]})
+                raise serializers.ValidationError(
+                    {"lines": ["At least one line item is required."]}
+                )
             validated_data.pop("lines", None)
 
             if not validated_data.get("pr_number"):
@@ -404,8 +459,7 @@ class CanCreateRequisitionPermission(permissions.BasePermission):
         )
 
         if not request.user.is_superuser and (
-            getattr(request.user, "is_vendor", False)
-            or role_code in [Role.VENDOR_USER]
+            getattr(request.user, "is_vendor", False) or role_code in [Role.VENDOR_USER]
         ):
             return False
 
@@ -416,6 +470,7 @@ class CanCreateRequisitionPermission(permissions.BasePermission):
             if action in ["approve", "reject"]:
                 return role_code in [
                     Role.DEPT_APPROVER,
+                    Role.PROC_MGR,
                     Role.FINANCE_AP,
                     Role.SUPER_ADMIN,
                 ]
@@ -457,6 +512,7 @@ class PurchaseRequisitionViewSet(viewsets.ModelViewSet):
             Role.LEGAL_MGR,
         ]:
             from rest_framework.exceptions import PermissionDenied
+
             raise PermissionDenied("Access to purchase requisitions is denied for your role.")
 
         if user.is_superuser or role_code in [
@@ -469,6 +525,7 @@ class PurchaseRequisitionViewSet(viewsets.ModelViewSet):
             qs = self.queryset
         elif role_code == Role.DEPT_APPROVER:
             from django.db.models import Q
+
             user_org = getattr(user, "organization", None) or (
                 user.department.organization if user.department else None
             )
@@ -501,7 +558,9 @@ class PurchaseRequisitionViewSet(viewsets.ModelViewSet):
 
             req_q = Q(requester=user)
             if user.department_id:
-                req_q |= Q(department_id=user.department_id) | Q(cost_center__department_id=user.department_id)
+                req_q |= Q(department_id=user.department_id) | Q(
+                    cost_center__department_id=user.department_id
+                )
             if user.cost_center_id:
                 req_q |= Q(cost_center_id=user.cost_center_id)
             qs = self.queryset.filter(req_q).distinct()
@@ -529,6 +588,7 @@ class PurchaseRequisitionViewSet(viewsets.ModelViewSet):
         )
         if search_param:
             from django.db.models import Q
+
             qs = qs.filter(
                 Q(pr_number__icontains=search_param)
                 | Q(title__icontains=search_param)
@@ -589,12 +649,16 @@ class PurchaseRequisitionViewSet(viewsets.ModelViewSet):
                     | Q(requester__department__organization=user_org)
                 )
                 if is_valid_uuid:
-                    in_same_org = same_org_qs.filter(Q(pk=lookup_val) | Q(pr_number__iexact=str(lookup_val))).exists()
+                    in_same_org = same_org_qs.filter(
+                        Q(pk=lookup_val) | Q(pr_number__iexact=str(lookup_val))
+                    ).exists()
                 else:
                     in_same_org = same_org_qs.filter(pr_number__iexact=str(lookup_val)).exists()
 
                 if in_same_org:
-                    raise PermissionDenied("You do not have permission to access this purchase requisition.")
+                    raise PermissionDenied(
+                        "You do not have permission to access this purchase requisition."
+                    )
 
             raise NotFound(f"Purchase requisition '{lookup_val}' not found.")
 
@@ -618,7 +682,11 @@ class PurchaseRequisitionViewSet(viewsets.ModelViewSet):
         instance = self.get_object()
         if instance.status != PurchaseRequisition.STATUS_DRAFT:
             raise serializers.ValidationError(
-                {"status": [f"Requisitions in '{instance.status}' status cannot be edited. Only DRAFT requisitions can be edited."]}
+                {
+                    "status": [
+                        f"Requisitions in '{instance.status}' status cannot be edited. Only DRAFT requisitions can be edited."
+                    ]
+                }
             )
         serializer.save()
 
@@ -690,7 +758,9 @@ class PurchaseRequisitionViewSet(viewsets.ModelViewSet):
             )
         if role_code == Role.DEPT_APPROVER:
             req_dept = pr.department or (pr.cost_center.department if pr.cost_center else None)
-            if (user.department_id and req_dept and user.department_id != req_dept.id) and not (pr.cost_center and user.id == pr.cost_center.manager_id):
+            if (user.department_id and req_dept and user.department_id != req_dept.id) and not (
+                pr.cost_center and user.id == pr.cost_center.manager_id
+            ):
                 has_own_approver = (
                     User.objects.filter(
                         role__code=Role.DEPT_APPROVER,
@@ -731,18 +801,33 @@ class PurchaseRequisitionViewSet(viewsets.ModelViewSet):
         role_code = getattr(user, "role_code", None) or (
             user.role.code if hasattr(user, "role") and user.role else None
         )
-        if pr.status in [PurchaseRequisition.STATUS_SUBMITTED, PurchaseRequisition.STATUS_MANAGER_REVIEW]:
-            if not user.is_superuser and role_code not in [Role.DEPT_APPROVER, Role.PROC_MGR, Role.SUPER_ADMIN]:
+        if pr.status in [
+            PurchaseRequisition.STATUS_SUBMITTED,
+            PurchaseRequisition.STATUS_MANAGER_REVIEW,
+        ]:
+            if not user.is_superuser and role_code not in [
+                Role.DEPT_APPROVER,
+                Role.PROC_MGR,
+                Role.SUPER_ADMIN,
+            ]:
                 raise permissions.exceptions.PermissionDenied(
                     "Only Department Approvers, Procurement Managers, or Super Admins can reject requisitions in Manager Review."
                 )
         elif pr.status == PurchaseRequisition.STATUS_BUDGET_REVIEW:
-            if not user.is_superuser and role_code not in [Role.FINANCE_AP, Role.PROC_MGR, Role.SUPER_ADMIN]:
+            if not user.is_superuser and role_code not in [
+                Role.FINANCE_AP,
+                Role.PROC_MGR,
+                Role.SUPER_ADMIN,
+            ]:
                 raise permissions.exceptions.PermissionDenied(
                     "Only Finance/AP or Procurement Managers can reject requisitions in Budget Review."
                 )
         else:
-            if not user.is_superuser and role_code not in [Role.DEPT_APPROVER, Role.PROC_MGR, Role.SUPER_ADMIN]:
+            if not user.is_superuser and role_code not in [
+                Role.DEPT_APPROVER,
+                Role.PROC_MGR,
+                Role.SUPER_ADMIN,
+            ]:
                 raise permissions.exceptions.PermissionDenied(
                     "You do not have permission to reject Purchase Requisitions."
                 )
