@@ -231,6 +231,7 @@ def calculate_vendor_scorecard_service(
         scorecard.responsiveness_score = compute_responsiveness_score(vendor)
         scorecard.compliance_score = compute_compliance_score(vendor)
         scorecard.sla_score = sla_rows[0]["actual_pct"] if sla_rows else None
+        scorecard.composite_score = None  # Force re-calculation on save
         if comments:
             scorecard.evaluator_comments = comments
         elif is_created:

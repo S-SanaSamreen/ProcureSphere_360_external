@@ -1816,3 +1816,8 @@ def generate_po_from_award_service(*, event: SourcingEvent, user: User, cost_cen
         sourcing_event=event,
         award=decision,
     )
+
+
+# Backwards compatibility alias for bid submission
+submit_sealed_bid_service = submit_vendor_bid_service
+

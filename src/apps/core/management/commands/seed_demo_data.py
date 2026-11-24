@@ -287,6 +287,32 @@ class Command(BaseCommand):
                 ],
             )
             submit_purchase_requisition_service(requisition=pr, user=requester)
+            from apps.requisitions.services import approve_purchase_requisition_service
+
+            approve_purchase_requisition_service(
+                requisition=pr, approver=approver, comments="Step 1 Department Approver Approval"
+            )
+            approve_purchase_requisition_service(
+                requisition=pr, approver=proc_mgr, comments="Step 2 Procurement Manager Approval"
+            )
+
+            # Create an active pending requisition so Approver inbox has realistic queue items
+            pr_pending = create_purchase_requisition_service(
+                title="Dell PowerEdge R760 Server Rack",
+                justification="Compute capacity expansion for ML inference workloads.",
+                requester=requester,
+                department=dept_it,
+                cost_center=cost_center,
+                requested_delivery_date=today + timezone.timedelta(days=45),
+                line_items=[
+                    {
+                        "item_description": "Dell PowerEdge R760 Rack Server",
+                        "quantity": 1,
+                        "estimated_unit_price": 12500.00,
+                    },
+                ],
+            )
+            submit_purchase_requisition_service(requisition=pr_pending, user=requester)
 
         # ── 9. RFQ with 3 Bids ────────────────────────────────────────────────
         rfq = SourcingEvent.objects.filter(title="RFQ — Core Network Infrastructure Upgrade").first()

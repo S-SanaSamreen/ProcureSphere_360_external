@@ -64,86 +64,84 @@ def _get_approval_querysets(user, role_code):
     history_statuses = ["APPROVED", "REJECTED", "SOURCING", "PO_ISSUED"]
 
     if role_code == Role.REQUESTER:
-        return (
-            PurchaseRequisition.objects.filter(requester=user, status__in=pending_statuses),
-            PurchaseRequisition.objects.filter(requester=user, status__in=history_statuses),
-        )
+        pending_qs = PurchaseRequisition.objects.filter(requester=user, status__in=pending_statuses)
+        history_qs = PurchaseRequisition.objects.filter(requester=user, status__in=history_statuses)
+    else:
+        user_approved_pr_ids = ApprovalAction.objects.filter(
+            actor=user,
+            target_model_name="PurchaseRequisition",
+            action__in=[ApprovalAction.ACTION_APPROVE, ApprovalAction.ACTION_REJECT],
+        ).values_list("target_object_id", flat=True)
 
-    user_approved_pr_ids = ApprovalAction.objects.filter(
-        actor=user,
-        target_model_name="PurchaseRequisition",
-        action__in=[ApprovalAction.ACTION_APPROVE, ApprovalAction.ACTION_REJECT],
-    ).values_list("target_object_id", flat=True)
+        if role_code == Role.DEPT_APPROVER:
+            user_dept = getattr(user, "department", None)
+            if not user_dept:
+                from apps.organization.models import CostCenter, Department
 
-    if role_code == Role.DEPT_APPROVER:
-        user_dept = getattr(user, "department", None)
-        if not user_dept:
-            from apps.organization.models import CostCenter, Department
-
-            managed_cc = (
-                CostCenter.objects.filter(manager=user)
-                .select_related("department")
-                .first()
-            )
-            if managed_cc and managed_cc.department:
-                user_dept = managed_cc.department
-            elif getattr(user, "organization", None):
-                user_dept = Department.objects.filter(
-                    organization=user.organization
-                ).first()
-
-        user_org = getattr(user, "organization", None) or (
-            user_dept.organization if user_dept else None
-        )
-        if user_dept:
-            from apps.organization.models import Department
-
-            depts_with_approvers = Department.objects.filter(
-                organization=user_org,
-                users__role__code=Role.DEPT_APPROVER,
-                users__is_active=True,
-            ).exclude(id=user_dept.id)
-
-            q = (
-                Q(department=user_dept)
-                | Q(cost_center__manager=user)
-                | (
-                    Q(department__organization=user_org)
-                    & ~Q(department__in=depts_with_approvers)
+                managed_cc = (
+                    CostCenter.objects.filter(manager=user)
+                    .select_related("department")
+                    .first()
                 )
+                if managed_cc and managed_cc.department:
+                    user_dept = managed_cc.department
+                elif getattr(user, "organization", None):
+                    user_dept = Department.objects.filter(
+                        organization=user.organization
+                    ).first()
+
+            user_org = getattr(user, "organization", None) or (
+                user_dept.organization if user_dept else None
             )
-            pending_qs = PurchaseRequisition.objects.filter(
-                q, status__in=pending_statuses
-            ).exclude(id__in=user_approved_pr_ids).distinct()
-            history_qs = PurchaseRequisition.objects.filter(
-                q & (Q(status__in=history_statuses) | Q(id__in=user_approved_pr_ids))
-            ).distinct()
-            return pending_qs, history_qs
-        elif user_org:
-            q = Q(department__organization=user_org) | Q(
-                cost_center__manager=user
-            )
-            pending_qs = PurchaseRequisition.objects.filter(
-                q, status__in=pending_statuses
-            ).exclude(id__in=user_approved_pr_ids).distinct()
-            history_qs = PurchaseRequisition.objects.filter(
-                q & (Q(status__in=history_statuses) | Q(id__in=user_approved_pr_ids))
-            ).distinct()
-            return pending_qs, history_qs
+            if user_dept:
+                from apps.organization.models import Department
+
+                depts_with_approvers = Department.objects.filter(
+                    organization=user_org,
+                    users__role__code=Role.DEPT_APPROVER,
+                    users__is_active=True,
+                ).exclude(id=user_dept.id)
+
+                q = (
+                    Q(department=user_dept)
+                    | Q(cost_center__manager=user)
+                    | (
+                        Q(department__organization=user_org)
+                        & ~Q(department__in=depts_with_approvers)
+                    )
+                )
+                pending_qs = PurchaseRequisition.objects.filter(
+                    q, status__in=pending_statuses
+                ).exclude(id__in=user_approved_pr_ids).distinct()
+                history_qs = PurchaseRequisition.objects.filter(
+                    q & (Q(status__in=history_statuses) | Q(id__in=user_approved_pr_ids))
+                ).distinct()
+            elif user_org:
+                q = Q(department__organization=user_org) | Q(
+                    cost_center__manager=user
+                )
+                pending_qs = PurchaseRequisition.objects.filter(
+                    q, status__in=pending_statuses
+                ).exclude(id__in=user_approved_pr_ids).distinct()
+                history_qs = PurchaseRequisition.objects.filter(
+                    q & (Q(status__in=history_statuses) | Q(id__in=user_approved_pr_ids))
+                ).distinct()
+            else:
+                pending_qs = PurchaseRequisition.objects.filter(
+                    status__in=pending_statuses
+                ).exclude(id__in=user_approved_pr_ids)
+                history_qs = PurchaseRequisition.objects.filter(
+                    Q(status__in=history_statuses) | Q(id__in=user_approved_pr_ids)
+                )
         else:
-            pending_qs = PurchaseRequisition.objects.filter(
-                status__in=pending_statuses
-            ).exclude(id__in=user_approved_pr_ids)
+            pending_qs = PurchaseRequisition.objects.filter(status__in=pending_statuses)
             history_qs = PurchaseRequisition.objects.filter(
                 Q(status__in=history_statuses) | Q(id__in=user_approved_pr_ids)
-            )
-            return pending_qs, history_qs
+            ).distinct()
 
     return (
-        PurchaseRequisition.objects.filter(status__in=pending_statuses),
-        PurchaseRequisition.objects.filter(
-            Q(status__in=history_statuses) | Q(id__in=user_approved_pr_ids)
-        ).distinct(),
+        pending_qs.select_related("department", "cost_center", "requester", "department__organization"),
+        history_qs.select_related("department", "cost_center", "requester", "department__organization"),
     )
 
 

@@ -470,7 +470,7 @@ class VendorBidViewSet(viewsets.ModelViewSet):
             )
         line_items = request.data.get("lines", request.data.get("line_items", []))
         try:
-            bid = services.submit_sealed_bid_service(
+            bid = services.submit_vendor_bid_service(
                 event=event,
                 vendor=vendor,
                 line_items=line_items,

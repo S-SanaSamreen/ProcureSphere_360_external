@@ -258,44 +258,23 @@ class ManagerPipelineAPIView(APIView):
             if org
             else PurchaseRequisition.objects.all()
         )
-        pr_submitted_qs = prs.filter(status=PurchaseRequisition.STATUS_SUBMITTED)
-        pr_mgr_review_qs = prs.filter(status=PurchaseRequisition.STATUS_MANAGER_REVIEW)
-        pr_budget_review_qs = prs.filter(status=PurchaseRequisition.STATUS_BUDGET_REVIEW)
-        pr_approved_qs = prs.filter(status=PurchaseRequisition.STATUS_APPROVED)
-        pr_rejected_qs = prs.filter(status=PurchaseRequisition.STATUS_REJECTED)
-        pr_sourcing_qs = prs.filter(status=PurchaseRequisition.STATUS_SOURCING)
+        pr_aggs = prs.values("status").annotate(count=Count("id"), amount=Sum("total_amount"))
+        pr_map = {row["status"]: {"count": row["count"], "amount": float(row["amount"] or 0)} for row in pr_aggs}
+        total_pr_count = sum(v["count"] for v in pr_map.values())
+        total_pr_amount = sum(v["amount"] for v in pr_map.values())
+
+        def _get_pr_stats(st):
+            return pr_map.get(st, {"count": 0, "amount": 0.0})
 
         requisitions_data = {
-            "submitted": {
-                "count": pr_submitted_qs.count(),
-                "amount": float(pr_submitted_qs.aggregate(total=Sum("total_amount"))["total"] or 0),
-            },
-            "manager_review": {
-                "count": pr_mgr_review_qs.count(),
-                "amount": float(
-                    pr_mgr_review_qs.aggregate(total=Sum("total_amount"))["total"] or 0
-                ),
-            },
-            "budget_review": {
-                "count": pr_budget_review_qs.count(),
-                "amount": float(
-                    pr_budget_review_qs.aggregate(total=Sum("total_amount"))["total"] or 0
-                ),
-            },
-            "approved": {
-                "count": pr_approved_qs.count(),
-                "amount": float(pr_approved_qs.aggregate(total=Sum("total_amount"))["total"] or 0),
-            },
-            "in_sourcing": {
-                "count": pr_sourcing_qs.count(),
-                "amount": float(pr_sourcing_qs.aggregate(total=Sum("total_amount"))["total"] or 0),
-            },
-            "rejected": {
-                "count": pr_rejected_qs.count(),
-                "amount": float(pr_rejected_qs.aggregate(total=Sum("total_amount"))["total"] or 0),
-            },
-            "total_count": prs.count(),
-            "total_amount": float(prs.aggregate(total=Sum("total_amount"))["total"] or 0),
+            "submitted": _get_pr_stats(PurchaseRequisition.STATUS_SUBMITTED),
+            "manager_review": _get_pr_stats(PurchaseRequisition.STATUS_MANAGER_REVIEW),
+            "budget_review": _get_pr_stats(PurchaseRequisition.STATUS_BUDGET_REVIEW),
+            "approved": _get_pr_stats(PurchaseRequisition.STATUS_APPROVED),
+            "in_sourcing": _get_pr_stats(PurchaseRequisition.STATUS_SOURCING),
+            "rejected": _get_pr_stats(PurchaseRequisition.STATUS_REJECTED),
+            "total_count": total_pr_count,
+            "total_amount": total_pr_amount,
         }
 
         # 2. Sourcing Events (RFQ/RFP)
@@ -314,18 +293,19 @@ class ManagerPipelineAPIView(APIView):
             events = SourcingEvent.objects.none()
         else:
             events = SourcingEvent.objects.all()
+
+        event_counts = events.values("status").annotate(c=Count("id"))
+        event_map = {row["status"]: row["c"] for row in event_counts}
         sourcing_data = {
-            "draft": events.filter(status=SourcingEvent.STATUS_DRAFT).count(),
-            "published": events.filter(status=SourcingEvent.STATUS_PUBLISHED).count(),
-            "bid_window_open": events.filter(status=SourcingEvent.STATUS_BID_WINDOW).count(),
-            "technical_review": events.filter(status=SourcingEvent.STATUS_TECHNICAL_REVIEW).count(),
-            "commercial_review": events.filter(
-                status=SourcingEvent.STATUS_COMMERCIAL_REVIEW
-            ).count(),
-            "award_approval": events.filter(status=SourcingEvent.STATUS_AWARD_APPROVAL).count(),
-            "awarded": events.filter(status=SourcingEvent.STATUS_AWARDED).count(),
-            "cancelled": events.filter(status=SourcingEvent.STATUS_CANCELLED).count(),
-            "total_events": events.count(),
+            "draft": event_map.get(SourcingEvent.STATUS_DRAFT, 0),
+            "published": event_map.get(SourcingEvent.STATUS_PUBLISHED, 0),
+            "bid_window_open": event_map.get(SourcingEvent.STATUS_BID_WINDOW, 0),
+            "technical_review": event_map.get(SourcingEvent.STATUS_TECHNICAL_REVIEW, 0),
+            "commercial_review": event_map.get(SourcingEvent.STATUS_COMMERCIAL_REVIEW, 0),
+            "award_approval": event_map.get(SourcingEvent.STATUS_AWARD_APPROVAL, 0),
+            "awarded": event_map.get(SourcingEvent.STATUS_AWARDED, 0),
+            "cancelled": event_map.get(SourcingEvent.STATUS_CANCELLED, 0),
+            "total_events": sum(event_map.values()),
         }
 
         # 3. Purchase Orders (PO)
@@ -334,72 +314,24 @@ class ManagerPipelineAPIView(APIView):
             if org
             else PurchaseOrder.objects.all()
         )
+        po_aggs = pos.values("status").annotate(count=Count("id"), amount=Sum("total_amount"))
+        po_map = {row["status"]: {"count": row["count"], "amount": float(row["amount"] or 0)} for row in po_aggs}
+        total_po_count = sum(v["count"] for v in po_map.values())
+        total_po_value = sum(v["amount"] for v in po_map.values())
+
+        def _get_po_stats(st):
+            return po_map.get(st, {"count": 0, "amount": 0.0})
+
         orders_data = {
-            "draft": {
-                "count": pos.filter(status=PurchaseOrder.STATUS_DRAFT).count(),
-                "amount": float(
-                    pos.filter(status=PurchaseOrder.STATUS_DRAFT).aggregate(
-                        total=Sum("total_amount")
-                    )["total"]
-                    or 0
-                ),
-            },
-            "in_approval": {
-                "count": pos.filter(status=PurchaseOrder.STATUS_APPROVAL).count(),
-                "amount": float(
-                    pos.filter(status=PurchaseOrder.STATUS_APPROVAL).aggregate(
-                        total=Sum("total_amount")
-                    )["total"]
-                    or 0
-                ),
-            },
-            "issued": {
-                "count": pos.filter(status=PurchaseOrder.STATUS_ISSUED).count(),
-                "amount": float(
-                    pos.filter(status=PurchaseOrder.STATUS_ISSUED).aggregate(
-                        total=Sum("total_amount")
-                    )["total"]
-                    or 0
-                ),
-            },
-            "acknowledged": {
-                "count": pos.filter(status=PurchaseOrder.STATUS_ACKNOWLEDGED).count(),
-                "amount": float(
-                    pos.filter(status=PurchaseOrder.STATUS_ACKNOWLEDGED).aggregate(
-                        total=Sum("total_amount")
-                    )["total"]
-                    or 0
-                ),
-            },
-            "partial_receipt": {
-                "count": pos.filter(status=PurchaseOrder.STATUS_PARTIAL_RECEIPT).count(),
-                "amount": float(
-                    pos.filter(status=PurchaseOrder.STATUS_PARTIAL_RECEIPT).aggregate(
-                        total=Sum("total_amount")
-                    )["total"]
-                    or 0
-                ),
-            },
-            "completed": {
-                "count": pos.filter(status=PurchaseOrder.STATUS_COMPLETED).count(),
-                "amount": float(
-                    pos.filter(status=PurchaseOrder.STATUS_COMPLETED).aggregate(
-                        total=Sum("total_amount")
-                    )["total"]
-                    or 0
-                ),
-            },
-            "cancelled": {
-                "count": pos.filter(status=PurchaseOrder.STATUS_CANCELLED).count(),
-                "amount": float(
-                    pos.filter(status=PurchaseOrder.STATUS_CANCELLED).aggregate(
-                        total=Sum("total_amount")
-                    )["total"]
-                    or 0
-                ),
-            },
-            "total_pos": pos.count(),
-            "total_po_value": float(pos.aggregate(total=Sum("total_amount"))["total"] or 0),
+            "draft": _get_po_stats(PurchaseOrder.STATUS_DRAFT),
+            "in_approval": _get_po_stats(PurchaseOrder.STATUS_APPROVAL),
+            "issued": _get_po_stats(PurchaseOrder.STATUS_ISSUED),
+            "acknowledged": _get_po_stats(PurchaseOrder.STATUS_ACKNOWLEDGED),
+            "partial_receipt": _get_po_stats(PurchaseOrder.STATUS_PARTIAL_RECEIPT),
+            "completed": _get_po_stats(PurchaseOrder.STATUS_COMPLETED),
+            "cancelled": _get_po_stats(PurchaseOrder.STATUS_CANCELLED),
+            "total_pos": total_po_count,
+            "total_po_value": total_po_value,
         }
 
         # 4. Receipts & Inspection
@@ -445,34 +377,26 @@ class ManagerPipelineAPIView(APIView):
             exceptions_open_qs = exceptions_open_qs.filter(
                 invoice__po__cost_center__department__organization=org
             )
+
+        inv_aggs = invoices.values("status").annotate(count=Count("id"), amount=Sum("total_amount"))
+        inv_map = {row["status"]: {"count": row["count"], "amount": float(row["amount"] or 0)} for row in inv_aggs}
+        total_invoices = sum(v["count"] for v in inv_map.values())
+
+        def _get_inv_stats(st):
+            return inv_map.get(st, {"count": 0, "amount": 0.0})
+
         invoices_data = {
-            "received": invoices.filter(status=SupplierInvoice.STATUS_RECEIVED).count(),
-            "matching": invoices.filter(status=SupplierInvoice.STATUS_MATCHING).count(),
+            "received": _get_inv_stats(SupplierInvoice.STATUS_RECEIVED)["count"],
+            "matching": _get_inv_stats(SupplierInvoice.STATUS_MATCHING)["count"],
             "exceptions_open": {
                 "count": exceptions_open_qs.count(),
                 "variance_amount": float(
                     exceptions_open_qs.aggregate(total=Sum("variance_amount"))["total"] or 0
                 ),
             },
-            "ready_for_payment": {
-                "count": invoices.filter(status=SupplierInvoice.STATUS_READY_FOR_PAYMENT).count(),
-                "amount": float(
-                    invoices.filter(status=SupplierInvoice.STATUS_READY_FOR_PAYMENT).aggregate(
-                        total=Sum("total_amount")
-                    )["total"]
-                    or 0
-                ),
-            },
-            "paid": {
-                "count": invoices.filter(status=SupplierInvoice.STATUS_PAID).count(),
-                "amount": float(
-                    invoices.filter(status=SupplierInvoice.STATUS_PAID).aggregate(
-                        total=Sum("total_amount")
-                    )["total"]
-                    or 0
-                ),
-            },
-            "total_invoices": invoices.count(),
+            "ready_for_payment": _get_inv_stats(SupplierInvoice.STATUS_READY_FOR_PAYMENT),
+            "paid": _get_inv_stats(SupplierInvoice.STATUS_PAID),
+            "total_invoices": total_invoices,
         }
 
         # 6. Overall Pipeline Summary Metrics
@@ -483,9 +407,8 @@ class ManagerPipelineAPIView(APIView):
             PurchaseRequisition.STATUS_APPROVED,
             PurchaseRequisition.STATUS_SOURCING,
         ]
-        active_prs_qs = prs.filter(status__in=active_pr_statuses)
-        active_prs_count = active_prs_qs.count()
-        active_prs_amount = float(active_prs_qs.aggregate(total=Sum("total_amount"))["total"] or 0)
+        active_prs_count = sum(pr_map.get(s, {}).get("count", 0) for s in active_pr_statuses)
+        active_prs_amount = sum(pr_map.get(s, {}).get("amount", 0.0) for s in active_pr_statuses)
 
         approval_pending_statuses = [
             PurchaseRequisition.STATUS_SUBMITTED,
@@ -493,30 +416,25 @@ class ManagerPipelineAPIView(APIView):
             PurchaseRequisition.STATUS_BUDGET_REVIEW,
         ]
         approval_pending_qs = prs.filter(status__in=approval_pending_statuses)
-        approval_pending_count = approval_pending_qs.count()
-        approval_pending_amount = float(
-            approval_pending_qs.aggregate(total=Sum("total_amount"))["total"] or 0
-        )
+        approval_pending_count = sum(pr_map.get(s, {}).get("count", 0) for s in approval_pending_statuses)
+        approval_pending_amount = sum(pr_map.get(s, {}).get("amount", 0.0) for s in approval_pending_statuses)
 
-        sourcing_in_progress_count = events.filter(
-            status__in=[
-                SourcingEvent.STATUS_PUBLISHED,
-                SourcingEvent.STATUS_BID_WINDOW,
-                SourcingEvent.STATUS_TECHNICAL_REVIEW,
-                SourcingEvent.STATUS_COMMERCIAL_REVIEW,
-                SourcingEvent.STATUS_AWARD_APPROVAL,
-            ]
-        ).count()
+        sourcing_in_progress_statuses = [
+            SourcingEvent.STATUS_PUBLISHED,
+            SourcingEvent.STATUS_BID_WINDOW,
+            SourcingEvent.STATUS_TECHNICAL_REVIEW,
+            SourcingEvent.STATUS_COMMERCIAL_REVIEW,
+            SourcingEvent.STATUS_AWARD_APPROVAL,
+        ]
+        sourcing_in_progress_count = sum(event_map.get(s, 0) for s in sourcing_in_progress_statuses)
 
-        active_pos_qs = pos.filter(
-            status__in=[
-                PurchaseOrder.STATUS_ISSUED,
-                PurchaseOrder.STATUS_ACKNOWLEDGED,
-                PurchaseOrder.STATUS_PARTIAL_RECEIPT,
-            ]
-        )
-        active_pos_count = active_pos_qs.count()
-        active_pos_amount = float(active_pos_qs.aggregate(total=Sum("total_amount"))["total"] or 0)
+        active_po_statuses = [
+            PurchaseOrder.STATUS_ISSUED,
+            PurchaseOrder.STATUS_ACKNOWLEDGED,
+            PurchaseOrder.STATUS_PARTIAL_RECEIPT,
+        ]
+        active_pos_count = sum(po_map.get(s, {}).get("count", 0) for s in active_po_statuses)
+        active_pos_amount = sum(po_map.get(s, {}).get("amount", 0.0) for s in active_po_statuses)
 
         # Bottleneck PRs: pending approval >= 3 days
         bottlenecks_cutoff = now - timezone.timedelta(days=3)
