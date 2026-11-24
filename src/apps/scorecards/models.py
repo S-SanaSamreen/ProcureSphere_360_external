@@ -89,13 +89,12 @@ class VendorScorecard(TimeStampedModel):
         "accounts.User", on_delete=models.PROTECT, related_name="evaluated_scorecards"
     )
 
-    # Existing approved weighting for the four core indicators. Responsiveness and SLA are
-    # reported but not weighted (see docs/assumptions.md ASSUMP-012, OPEN DECISION).
+    # Approved equal weighting for the four core indicators (each 25%), matching 4-component average.
     CORE_WEIGHTS = {
-        "delivery_score": Decimal("0.30"),
-        "quality_score": Decimal("0.30"),
-        "price_score": Decimal("0.20"),
-        "compliance_score": Decimal("0.20"),
+        "delivery_score": Decimal("0.25"),
+        "quality_score": Decimal("0.25"),
+        "price_score": Decimal("0.25"),
+        "compliance_score": Decimal("0.25"),
     }
 
     class Meta:
@@ -177,9 +176,7 @@ class VendorScorecardSLAMetric(TimeStampedModel):
     actual_pct = models.DecimalField(
         max_digits=5, decimal_places=2, null=True, blank=True, help_text="None when no data"
     )
-    achievement_pct = models.DecimalField(
-        max_digits=5, decimal_places=2, null=True, blank=True
-    )
+    achievement_pct = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
     breaches = models.PositiveIntegerField(default=0)
     observations = models.PositiveIntegerField(default=0, help_text="Due obligations counted")
     notes = models.TextField(blank=True)

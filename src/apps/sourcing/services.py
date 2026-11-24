@@ -116,6 +116,7 @@ def _transition_event(
 def _next_document_number(model, field: str, prefix: str) -> str:
     """Sequential document number unique for the given prefix, generated using PostgreSQL advisory locking."""
     from apps.core.services import generate_document_number
+
     return generate_document_number(model, field, prefix)
 
 
@@ -132,7 +133,13 @@ def _parse_weight(value, label):
 
 
 def _validate_event_fields(
-    *, title, event_type, bid_start_date, bid_end_date, description, weights,
+    *,
+    title,
+    event_type,
+    bid_start_date,
+    bid_end_date,
+    description,
+    weights,
     enforce_future_start: bool = False,
 ):
     errors = []
@@ -149,6 +156,7 @@ def _validate_event_fields(
     from datetime import timedelta
 
     from django.utils import timezone
+
     now_buffer = timezone.now() - timedelta(minutes=15)
     if enforce_future_start and bid_start_date:
         start_cmp = (
@@ -160,9 +168,7 @@ def _validate_event_fields(
             errors.append("Bid start date cannot be in the past.")
     if bid_end_date:
         end_cmp = (
-            bid_end_date
-            if timezone.is_aware(bid_end_date)
-            else timezone.make_aware(bid_end_date)
+            bid_end_date if timezone.is_aware(bid_end_date) else timezone.make_aware(bid_end_date)
         )
         if end_cmp < now_buffer:
             errors.append("Bid deadline cannot be in the past.")
@@ -1268,7 +1274,9 @@ def answer_clarification_service(
     if event.status in (SourcingEvent.STATUS_AWARDED, SourcingEvent.STATUS_CANCELLED):
         raise ValidationError(f"Clarifications are closed for a {event.status} event.")
     if clarification.status == "ANSWERED":
-        raise ValidationError("This clarification has already been answered and cannot be overwritten.")
+        raise ValidationError(
+            "This clarification has already been answered and cannot be overwritten."
+        )
     if not (answer or "").strip():
         raise ValidationError("Answer cannot be blank.")
 
@@ -1652,7 +1660,10 @@ def evaluate_and_award_sourcing_event_service(
         raise ValidationError("Award justification is required.")
 
     recommender = recommended_by or event.created_by
-    if not recommender or (recommender.id == approved_by_user.id and not getattr(approved_by_user, "is_superuser", False)):
+    if not recommender or (
+        recommender.id == approved_by_user.id
+        and not getattr(approved_by_user, "is_superuser", False)
+    ):
         alt_evaluator = (
             User.objects.filter(evaluations__bid__event=event)
             .exclude(id=approved_by_user.id)
@@ -1663,7 +1674,10 @@ def evaluate_and_award_sourcing_event_service(
         elif recommender is None:
             recommender = approved_by_user
 
-    if event.status in [SourcingEvent.STATUS_TECHNICAL_REVIEW, SourcingEvent.STATUS_COMMERCIAL_REVIEW]:
+    if event.status in [
+        SourcingEvent.STATUS_TECHNICAL_REVIEW,
+        SourcingEvent.STATUS_COMMERCIAL_REVIEW,
+    ]:
         decision = AwardDecision.objects.create(
             event=event,
             winning_bid=winning_bid,
@@ -1722,6 +1736,20 @@ def cancel_sourcing_event_service(
         action=AuditLog.ACTION_CANCEL,
         extra={"reason": reason.strip()},
     )
+    if event.requisition:
+        from apps.requisitions.models import PurchaseRequisition
+
+        if event.requisition.status == PurchaseRequisition.STATUS_SOURCING:
+            event.requisition.status = PurchaseRequisition.STATUS_APPROVED
+            event.requisition.save(update_fields=["status", "updated_at"])
+            create_audit_log_service(
+                actor=user,
+                action=AuditLog.ACTION_UPDATE,
+                target_model="PurchaseRequisition",
+                target_object_id=event.requisition.id,
+                previous_state={"status": PurchaseRequisition.STATUS_SOURCING},
+                new_state={"status": PurchaseRequisition.STATUS_APPROVED},
+            )
     for invite in event.invitations.select_related("vendor"):
         notify_vendor_users(
             vendor=invite.vendor,

@@ -7,7 +7,7 @@ from django.utils import timezone
 from apps.accounts.models import Role, User
 from apps.audit.models import AuditLog
 from apps.audit.services import create_audit_log_service
-from apps.budgets.models import Budget, SpendLedger
+from apps.budgets.models import SpendLedger
 from apps.notifications.models import Notification
 from apps.organization.models import CostCenter
 from apps.vendors.models import Vendor
@@ -19,14 +19,16 @@ def _get_budget_for_po(po, cost_center=None, for_update=False):
     cc = cost_center or getattr(po, "cost_center", None)
     if not cc:
         return None
-    from apps.budgets.models import Budget
     from django.utils import timezone
+
+    from apps.budgets.models import Budget
+
     target_date = getattr(po, "created_at", None)
     if target_date and hasattr(target_date, "date"):
         target_date = target_date.date()
     else:
         target_date = timezone.now().date()
-    
+
     qs = Budget.objects.select_for_update() if for_update else Budget.objects
     budget = qs.filter(
         cost_center=cc,
@@ -35,10 +37,14 @@ def _get_budget_for_po(po, cost_center=None, for_update=False):
         fiscal_period__is_closed=False,
     ).first()
     if not budget:
-        budget = qs.filter(
-            cost_center=cc,
-            fiscal_period__is_closed=False,
-        ).order_by("-fiscal_period__start_date").first()
+        budget = (
+            qs.filter(
+                cost_center=cc,
+                fiscal_period__is_closed=False,
+            )
+            .order_by("-fiscal_period__start_date")
+            .first()
+        )
     if not budget:
         budget = qs.filter(cost_center=cc).order_by("-fiscal_period__start_date").first()
     if not budget:
@@ -69,9 +75,7 @@ def generate_purchase_order_service(
     from apps.core.services import generate_document_number
 
     if cost_center is None:
-        raise ValidationError(
-            "A cost center is required to generate a Purchase Order."
-        )
+        raise ValidationError("A cost center is required to generate a Purchase Order.")
 
     if vendor.status != Vendor.STATUS_ACTIVE:
         raise ValidationError(
@@ -80,6 +84,7 @@ def generate_purchase_order_service(
 
     if sourcing_event:
         from apps.sourcing.models import SourcingEvent
+
         if sourcing_event.status != SourcingEvent.STATUS_AWARDED:
             raise ValidationError(
                 f"Cannot generate Purchase Order from Sourcing Event '{sourcing_event.event_number}': Event status is '{sourcing_event.status}' (must be AWARDED)."
@@ -87,9 +92,14 @@ def generate_purchase_order_service(
 
     if requisition:
         from apps.requisitions.models import PurchaseRequisition
+
         if hasattr(requisition, "refresh_from_db"):
             requisition.refresh_from_db()
-        if requisition.status not in (PurchaseRequisition.STATUS_APPROVED, PurchaseRequisition.STATUS_SOURCING, PurchaseRequisition.STATUS_PO_ISSUED):
+        if requisition.status not in (
+            PurchaseRequisition.STATUS_APPROVED,
+            PurchaseRequisition.STATUS_SOURCING,
+            PurchaseRequisition.STATUS_PO_ISSUED,
+        ):
             raise ValidationError(
                 f"Cannot generate Purchase Order from Requisition '{requisition.pr_number}': Requisition status is '{requisition.status}' (must be APPROVED)."
             )
@@ -119,9 +129,13 @@ def generate_purchase_order_service(
         qty = Decimal(str(item["quantity"]))
         unit_price = Decimal(str(item["unit_price"]))
         if qty <= Decimal("0.00"):
-            raise ValidationError(f"Quantity for line item '{item.get('item_description', '')}' must be positive.")
-        if unit_price < Decimal("0.00"):
-            raise ValidationError(f"Unit price for line item '{item.get('item_description', '')}' cannot be negative.")
+            raise ValidationError(
+                f"Quantity for line item '{item.get('item_description', '')}' must be positive."
+            )
+        if unit_price <= Decimal("0.00"):
+            raise ValidationError(
+                f"Unit price for line item '{item.get('item_description', '')}' must be greater than zero."
+            )
 
         line = POLine.objects.create(
             po=po,
@@ -169,6 +183,7 @@ def generate_purchase_order_service(
 
         if target_requisition:
             from apps.budgets.services import release_budget_reservation_service
+
             try:
                 release_budget_reservation_service(
                     requisition=target_requisition,
@@ -234,9 +249,7 @@ def acknowledge_purchase_order_service(
     Vendor acknowledges an issued PO. Transitions status to ACKNOWLEDGED.
     """
     if po.status != PurchaseOrder.STATUS_ISSUED:
-        raise ValidationError(
-            f"Cannot acknowledge PO in status '{po.status}'. Must be ISSUED."
-        )
+        raise ValidationError(f"Cannot acknowledge PO in status '{po.status}'. Must be ISSUED.")
 
     if not (
         getattr(vendor_user, "is_superuser", False)
@@ -319,7 +332,11 @@ def request_po_amendment_service(
     if not reason or not str(reason).strip():
         raise ValidationError("Amendment justification reason is required.")
 
-    if po.status in (PurchaseOrder.STATUS_CANCELLED, PurchaseOrder.STATUS_DRAFT, PurchaseOrder.STATUS_COMPLETED):
+    if po.status in (
+        PurchaseOrder.STATUS_CANCELLED,
+        PurchaseOrder.STATUS_DRAFT,
+        PurchaseOrder.STATUS_COMPLETED,
+    ):
         raise ValidationError(
             f"Purchase orders in '{po.get_status_display()}' status cannot be amended."
         )
@@ -335,9 +352,7 @@ def request_po_amendment_service(
         )
 
     role_code = getattr(requested_by_user, "role_code", None) or (
-        requested_by_user.role.code
-        if getattr(requested_by_user, "role", None)
-        else None
+        requested_by_user.role.code if getattr(requested_by_user, "role", None) else None
     )
     if not (
         getattr(requested_by_user, "is_superuser", False)
@@ -348,9 +363,7 @@ def request_po_amendment_service(
         )
 
     if po.amendments.filter(status=POAmendment.STATUS_PENDING).exists():
-        raise ValidationError(
-            "A pending amendment already exists for this purchase order."
-        )
+        raise ValidationError("A pending amendment already exists for this purchase order.")
 
     # 1. Take JSON snapshot of previous version
     snapshot = {
@@ -411,11 +424,15 @@ def request_po_amendment_service(
         try:
             qty = Decimal(str(item["quantity"]))
         except Exception:
-            raise ValidationError(f"Invalid quantity '{item.get('quantity')}' in amendment line {idx + 1}.")
+            raise ValidationError(
+                f"Invalid quantity '{item.get('quantity')}' in amendment line {idx + 1}."
+            )
         try:
             unit_price = Decimal(str(item["unit_price"]))
         except Exception:
-            raise ValidationError(f"Invalid unit price '{item.get('unit_price')}' in amendment line {idx + 1}.")
+            raise ValidationError(
+                f"Invalid unit price '{item.get('unit_price')}' in amendment line {idx + 1}."
+            )
 
         if qty <= Decimal("0.00"):
             raise ValidationError(f"Quantity must be greater than zero for line item {idx + 1}.")
@@ -463,9 +480,7 @@ def request_po_amendment_service(
     # Guard against removing lines referenced by goods receipts
     for line in existing_lines:
         if line.id not in matched_line_ids:
-            has_receipts = (
-                line.quantity_received > Decimal("0.00") or line.receipt_lines.exists()
-            )
+            has_receipts = line.quantity_received > Decimal("0.00") or line.receipt_lines.exists()
             if has_receipts:
                 raise ValidationError(
                     f"Cannot delete line '{line.item_description}' referenced by goods receipts."
@@ -566,17 +581,14 @@ def approve_po_amendment_service(
         approver.role.code if getattr(approver, "role", None) else None
     )
     if not (
-        getattr(approver, "is_superuser", False)
-        or role_code in (Role.PROC_MGR, Role.SUPER_ADMIN)
+        getattr(approver, "is_superuser", False) or role_code in (Role.PROC_MGR, Role.SUPER_ADMIN)
     ):
         raise ValidationError(
             "Permission Denied: Only Procurement Managers or Super Admin can approve PO amendments."
         )
 
     # Enforce strict Separation of Duties
-    if amendment.requested_by_id == approver.id and not getattr(
-        approver, "is_superuser", False
-    ):
+    if amendment.requested_by_id == approver.id and not getattr(approver, "is_superuser", False):
         raise ValidationError(
             "Separation of duties violation: PO amendment requester cannot approve their own amendment."
         )
@@ -649,22 +661,26 @@ def approve_po_amendment_service(
     # Guard against removing lines referenced by receipts
     for line in existing_lines:
         if line.id not in matched_line_ids:
-            has_receipts = (
-                line.quantity_received > Decimal("0.00") or line.receipt_lines.exists()
-            )
+            has_receipts = line.quantity_received > Decimal("0.00") or line.receipt_lines.exists()
             if has_receipts:
                 raise ValidationError(
                     f"Cannot delete line '{line.item_description}' referenced by goods receipts."
                 )
             line.delete()
 
-    subtotal_val = Decimal(str(proposed_changes.get("subtotal", subtotal))).quantize(Decimal("0.01"))
+    subtotal_val = Decimal(str(proposed_changes.get("subtotal", subtotal))).quantize(
+        Decimal("0.01")
+    )
     tax_val = Decimal(
-        str(proposed_changes.get("tax_amount", (subtotal * Decimal("0.10")).quantize(Decimal("0.01"))))
+        str(
+            proposed_changes.get(
+                "tax_amount", (subtotal * Decimal("0.10")).quantize(Decimal("0.01"))
+            )
+        )
     ).quantize(Decimal("0.01"))
-    total_val = Decimal(
-        str(proposed_changes.get("total_amount", subtotal_val + tax_val))
-    ).quantize(Decimal("0.01"))
+    total_val = Decimal(str(proposed_changes.get("total_amount", subtotal_val + tax_val))).quantize(
+        Decimal("0.01")
+    )
     diff = amendment.delta_amount
 
     # Update PO version, values, and reset vendor acknowledgement
@@ -694,9 +710,7 @@ def approve_po_amendment_service(
     if diff != Decimal("0.00"):
         budget = _get_budget_for_po(po, for_update=True)
         if budget:
-            budget.committed_amount = max(
-                Decimal("0.00"), budget.committed_amount + diff
-            )
+            budget.committed_amount = max(Decimal("0.00"), budget.committed_amount + diff)
             budget.save(update_fields=["committed_amount", "updated_at"])
 
             SpendLedger.objects.create(
@@ -806,8 +820,7 @@ def reject_po_amendment_service(
         rejector.role.code if getattr(rejector, "role", None) else None
     )
     if not (
-        getattr(rejector, "is_superuser", False)
-        or role_code in (Role.PROC_MGR, Role.SUPER_ADMIN)
+        getattr(rejector, "is_superuser", False) or role_code in (Role.PROC_MGR, Role.SUPER_ADMIN)
     ):
         raise ValidationError(
             "Permission Denied: Only Procurement Managers or Super Admin can reject PO amendments."
@@ -932,8 +945,7 @@ def cancel_purchase_order_governance_service(
         actor.role.code if getattr(actor, "role", None) else None
     )
     if not (
-        getattr(actor, "is_superuser", False)
-        or role_code in (Role.PROC_MGR, Role.SUPER_ADMIN)
+        getattr(actor, "is_superuser", False) or role_code in (Role.PROC_MGR, Role.SUPER_ADMIN)
     ):
         raise ValidationError(
             "Permission Denied: Only Procurement Managers or Super Admin can cancel purchase orders."
@@ -946,9 +958,7 @@ def cancel_purchase_order_governance_service(
         raise ValidationError(f"Purchase Order {po.po_number} is already cancelled.")
 
     if po.status == PurchaseOrder.STATUS_COMPLETED:
-        raise ValidationError(
-            f"Cannot cancel completed/fulfilled Purchase Order {po.po_number}."
-        )
+        raise ValidationError(f"Cannot cancel completed/fulfilled Purchase Order {po.po_number}.")
 
     previous_status = po.status
     po.status = PurchaseOrder.STATUS_CANCELLED
@@ -960,12 +970,11 @@ def cancel_purchase_order_governance_service(
         if line.quantity_received:
             total_received_value += line.quantity_received * line.unit_price
 
-    unfulfilled_commitment = max(
-        Decimal("0.00"), po.total_amount - total_received_value
-    )
+    unfulfilled_commitment = max(Decimal("0.00"), po.total_amount - total_received_value)
 
     had_commitment = (
-        previous_status in (
+        previous_status
+        in (
             PurchaseOrder.STATUS_APPROVED,
             PurchaseOrder.STATUS_ISSUED,
             PurchaseOrder.STATUS_ACKNOWLEDGED,
@@ -1018,6 +1027,7 @@ def cancel_purchase_order_governance_service(
     ):
         try:
             from apps.notifications.services import notify_vendor_users
+
             notify_vendor_users(
                 vendor=po.vendor,
                 notification_type=Notification.TYPE_PO_ISSUED,
@@ -1032,9 +1042,7 @@ def cancel_purchase_order_governance_service(
 
 
 @transaction.atomic
-def submit_purchase_order_for_approval_service(
-    *, po: PurchaseOrder, actor: User
-) -> PurchaseOrder:
+def submit_purchase_order_for_approval_service(*, po: PurchaseOrder, actor: User) -> PurchaseOrder:
     """
     Submits a draft PO for managerial review and approval.
     Transitions DRAFT -> APPROVAL and records the submitter for
@@ -1113,8 +1121,7 @@ def approve_purchase_order_service(
         approver.role.code if getattr(approver, "role", None) else None
     )
     if not (
-        getattr(approver, "is_superuser", False)
-        or role_code in (Role.PROC_MGR, Role.SUPER_ADMIN)
+        getattr(approver, "is_superuser", False) or role_code in (Role.PROC_MGR, Role.SUPER_ADMIN)
     ):
         raise ValidationError(
             "Permission Denied: Only Procurement Managers or Super Admin can approve purchase orders."
@@ -1186,6 +1193,7 @@ def approve_purchase_order_service(
 
     if po.requisition:
         from apps.budgets.services import release_budget_reservation_service
+
         try:
             release_budget_reservation_service(
                 requisition=po.requisition,
@@ -1225,9 +1233,7 @@ def approve_purchase_order_service(
 
 
 @transaction.atomic
-def issue_purchase_order_service(
-    *, po: PurchaseOrder, actor: User
-) -> PurchaseOrder:
+def issue_purchase_order_service(*, po: PurchaseOrder, actor: User) -> PurchaseOrder:
     """
     Procurement Executive issues an APPROVED purchase order to the vendor.
     Transitions APPROVED -> ISSUED, records issuer/timestamp and notifies
@@ -1237,17 +1243,14 @@ def issue_purchase_order_service(
         actor.role.code if getattr(actor, "role", None) else None
     )
     if not (
-        getattr(actor, "is_superuser", False)
-        or role_code in (Role.PROC_EXEC, Role.SUPER_ADMIN)
+        getattr(actor, "is_superuser", False) or role_code in (Role.PROC_EXEC, Role.SUPER_ADMIN)
     ):
         raise ValidationError(
             "Permission Denied: Only Procurement Executives or Super Admin can issue purchase orders."
         )
 
     if po.status != PurchaseOrder.STATUS_APPROVED:
-        raise ValidationError(
-            f"Cannot issue PO in status '{po.status}'. Must be APPROVED."
-        )
+        raise ValidationError(f"Cannot issue PO in status '{po.status}'. Must be APPROVED.")
 
     if po.vendor.status != Vendor.STATUS_ACTIVE:
         raise ValidationError(
@@ -1272,6 +1275,7 @@ def issue_purchase_order_service(
 
     if po.requisition:
         from apps.budgets.services import release_budget_reservation_service
+
         try:
             release_budget_reservation_service(
                 requisition=po.requisition,
@@ -1282,10 +1286,13 @@ def issue_purchase_order_service(
             pass
 
     # Record commitment on spend ledger if not already recorded
-    from apps.budgets.models import Budget, SpendLedger
+    from apps.budgets.models import SpendLedger
+
     budget = _get_budget_for_po(po, for_update=True)
     if budget:
-        if not SpendLedger.objects.filter(reference_number=po.po_number, entry_type=SpendLedger.ENTRY_COMMITMENT).exists():
+        if not SpendLedger.objects.filter(
+            reference_number=po.po_number, entry_type=SpendLedger.ENTRY_COMMITMENT
+        ).exists():
             budget.committed_amount += po.total_amount
             budget.save(update_fields=["committed_amount", "updated_at"])
             SpendLedger.objects.create(
@@ -1326,9 +1333,7 @@ def issue_purchase_order_service(
             recipient=po.requisition.requester,
             notification_type=Notification.TYPE_PO_ISSUED,
             title=f"PO {po.po_number} Issued",
-            message=(
-                f"Purchase Order {po.po_number} has been issued to {po.vendor.legal_name}."
-            ),
+            message=(f"Purchase Order {po.po_number} has been issued to {po.vendor.legal_name}."),
             target_url=f"/orders/{po.id}/",
         )
 
@@ -1396,9 +1401,7 @@ def reject_purchase_order_service(
         raise ValidationError("Rejection reason is required.")
 
     if po.status != PurchaseOrder.STATUS_APPROVAL:
-        raise ValidationError(
-            f"Cannot reject PO in status '{po.status}'. Must be APPROVAL."
-        )
+        raise ValidationError(f"Cannot reject PO in status '{po.status}'. Must be APPROVAL.")
 
     previous_status = po.status
     po.status = PurchaseOrder.STATUS_DRAFT
@@ -1460,9 +1463,7 @@ def vendor_reject_purchase_order_service(
         raise ValidationError("A rejection reason is required.")
 
     if po.status != PurchaseOrder.STATUS_ISSUED:
-        raise ValidationError(
-            f"Cannot reject PO in status '{po.status}'. Must be ISSUED."
-        )
+        raise ValidationError(f"Cannot reject PO in status '{po.status}'. Must be ISSUED.")
 
     if not getattr(vendor_user, "vendor_id", None) or po.vendor_id != vendor_user.vendor_id:
         raise ValidationError(
@@ -1581,24 +1582,16 @@ def update_draft_purchase_order_service(
     subtotal = Decimal("0.00")
     for idx, (line, item) in enumerate(zip(lines, updated_line_items)):
         if item.get("quantity") is None or item.get("unit_price") is None:
-            raise ValidationError(
-                f"Line item {idx + 1} must include both quantity and unit price."
-            )
+            raise ValidationError(f"Line item {idx + 1} must include both quantity and unit price.")
         try:
             qty = Decimal(str(item["quantity"]))
             unit_price = Decimal(str(item["unit_price"]))
         except Exception:
-            raise ValidationError(
-                f"Invalid quantity or unit price on line item {idx + 1}."
-            )
+            raise ValidationError(f"Invalid quantity or unit price on line item {idx + 1}.")
         if qty <= Decimal("0.00"):
-            raise ValidationError(
-                f"Quantity must be greater than zero for line item {idx + 1}."
-            )
+            raise ValidationError(f"Quantity must be greater than zero for line item {idx + 1}.")
         if unit_price < Decimal("0.00"):
-            raise ValidationError(
-                f"Unit price cannot be negative for line item {idx + 1}."
-            )
+            raise ValidationError(f"Unit price cannot be negative for line item {idx + 1}.")
 
         line.quantity = qty
         line.unit_price = unit_price
@@ -1609,9 +1602,7 @@ def update_draft_purchase_order_service(
     po.subtotal = subtotal.quantize(Decimal("0.01"))
     po.tax_amount = tax
     po.total_amount = (subtotal + tax).quantize(Decimal("0.01"))
-    po.save(
-        update_fields=["subtotal", "tax_amount", "total_amount", "updated_at"]
-    )
+    po.save(update_fields=["subtotal", "tax_amount", "total_amount", "updated_at"])
 
     AuditLog.objects.create(
         actor=actor,

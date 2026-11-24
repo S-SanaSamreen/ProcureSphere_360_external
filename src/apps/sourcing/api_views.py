@@ -162,7 +162,8 @@ class SourcingEventViewSet(
         _require_manage(request)
         event = self.get_object()
         active_invites = [
-            i for i in event.invitations.select_related("vendor").all()
+            i
+            for i in event.invitations.select_related("vendor").all()
             if getattr(i.vendor, "status", None) == "ACTIVE"
         ]
         if len(active_invites) < 3:
@@ -171,7 +172,9 @@ class SourcingEventViewSet(
                     "error": {
                         "code": "min_vendors_required",
                         "message": "Invite at least 3 ACTIVE vendors before publishing.",
-                        "details": {"invitations": ["Invite at least 3 ACTIVE vendors before publishing."]},
+                        "details": {
+                            "invitations": ["Invite at least 3 ACTIVE vendors before publishing."]
+                        },
                     }
                 },
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -375,9 +378,12 @@ class SourcingEventViewSet(
         """
         event = self.get_object()
         cost_center = None
-        cost_center_id = request.data.get("cost_center_id") if isinstance(request.data, dict) else None
+        cost_center_id = (
+            request.data.get("cost_center_id") if isinstance(request.data, dict) else None
+        )
         if cost_center_id:
             from apps.organization.models import CostCenter
+
             cost_center = get_object_or_404(CostCenter, pk=cost_center_id)
         try:
             from apps.orders.api_urls import PurchaseOrderSerializer
@@ -401,14 +407,91 @@ class SourcingEventViewSet(
             )
 
 
-class VendorBidViewSet(viewsets.ReadOnlyModelViewSet):
+class VendorBidViewSet(viewsets.ModelViewSet):
     """
     Bids: vendors see only their own; internal bid readers see submitted bids only after the
     bid window closes, with the commercial envelope sealed until COMMERCIAL_REVIEW.
     """
 
+    http_method_names = ["get", "post", "head", "options"]
     serializer_class = VendorBidSerializer
     permission_classes = [BidPermission]
+
+    def create(self, request, *args, **kwargs):
+        from django.core.exceptions import ValidationError
+
+        from apps.accounts.models import Role
+        from apps.vendors.models import Vendor
+
+        user = request.user
+        if (
+            not getattr(user, "is_vendor", False)
+            and getattr(user, "role_code", None) != Role.VENDOR_USER
+            and not user.is_superuser
+        ):
+            raise PermissionDenied("Only registered vendor users can submit bids.")
+        event_id = request.data.get("event") or request.data.get("event_id")
+        if not event_id:
+            return Response(
+                {
+                    "error": {
+                        "code": "VALIDATION_ERROR",
+                        "message": "event is required.",
+                        "details": {"event": ["This field is required."]},
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            event = SourcingEvent.objects.get(pk=event_id)
+        except Exception:
+            return Response(
+                {
+                    "error": {
+                        "code": "NOT_FOUND",
+                        "message": f"Sourcing event '{event_id}' not found.",
+                    }
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        vendor = getattr(user, "vendor", None)
+        if not vendor and user.is_superuser:
+            vendor_id = request.data.get("vendor") or request.data.get("vendor_id")
+            vendor = Vendor.objects.filter(pk=vendor_id).first()
+        if not vendor:
+            return Response(
+                {
+                    "error": {
+                        "code": "VALIDATION_ERROR",
+                        "message": "No vendor account associated with this user.",
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        line_items = request.data.get("lines", request.data.get("line_items", []))
+        try:
+            bid = services.submit_sealed_bid_service(
+                event=event,
+                vendor=vendor,
+                line_items=line_items,
+                proposal_summary=request.data.get("proposal_summary", ""),
+                technical_proposal=request.data.get("technical_proposal", ""),
+                commercial_proposal=request.data.get("commercial_proposal", ""),
+                submitted_by_user=user,
+            )
+            return Response(self.get_serializer(bid).data, status=status.HTTP_201_CREATED)
+        except ValidationError as e:
+            msg = e.messages if hasattr(e, "messages") else [str(e)]
+            return Response(
+                {
+                    "error": {
+                        "code": "VALIDATION_ERROR",
+                        "message": msg[0] if isinstance(msg, list) else str(e),
+                        "details": msg,
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
     def get_queryset(self):
         user = self.request.user

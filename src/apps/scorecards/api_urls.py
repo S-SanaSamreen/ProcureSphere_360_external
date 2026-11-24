@@ -26,13 +26,21 @@ class CanManageScorecards(permissions.BasePermission):
         role = getattr(request.user, "role_code", None) or (
             request.user.role.code if getattr(request.user, "role", None) else None
         )
-        if not request.user.is_superuser and role in [Role.REQUESTER, Role.DEPT_APPROVER, Role.LEGAL_MGR]:
+        if not request.user.is_superuser and role in [
+            Role.REQUESTER,
+            Role.DEPT_APPROVER,
+            Role.LEGAL_MGR,
+        ]:
             return False
         if request.method in permissions.SAFE_METHODS:
             return True
         if view.action == "destroy":
             return request.user.is_superuser or role in [Role.SUPER_ADMIN, Role.PROC_MGR]
-        return request.user.is_superuser or role in [Role.PROC_EXEC, Role.PROC_MGR, Role.SUPER_ADMIN]
+        return request.user.is_superuser or role in [
+            Role.PROC_EXEC,
+            Role.PROC_MGR,
+            Role.SUPER_ADMIN,
+        ]
 
 
 class VendorScorecardSerializer(serializers.ModelSerializer):
@@ -118,11 +126,17 @@ class VendorScorecardSerializer(serializers.ModelSerializer):
         period = attrs.get("evaluation_period", getattr(self.instance, "evaluation_period", None))
         if vendor and period:
             vendor_id = getattr(vendor, "id", vendor)
-            qs = VendorScorecard.objects.filter(vendor_id=vendor_id, evaluation_period__iexact=str(period).strip())
+            qs = VendorScorecard.objects.filter(
+                vendor_id=vendor_id, evaluation_period__iexact=str(period).strip()
+            )
             if self.instance:
                 qs = qs.exclude(pk=self.instance.pk)
             if qs.exists():
-                raise serializers.ValidationError({"evaluation_period": f"A scorecard for this vendor for period '{period}' already exists."})
+                raise serializers.ValidationError(
+                    {
+                        "evaluation_period": f"A scorecard for this vendor for period '{period}' already exists."
+                    }
+                )
 
         for field in score_fields:
             val = attrs.get(field)
@@ -140,7 +154,9 @@ class VendorScorecardSerializer(serializers.ModelSerializer):
             expected_comp = (d_score + q_score + p_score + c_score) / Decimal("4.00")
             if comp_score is not None and abs(comp_score - expected_comp) > Decimal("0.50"):
                 raise serializers.ValidationError(
-                    {"composite_score": f"Composite score ({comp_score}) does not match weighted component average ({expected_comp:.2f})."}
+                    {
+                        "composite_score": f"Composite score ({comp_score}) does not match weighted component average ({expected_comp:.2f})."
+                    }
                 )
         return attrs
 
@@ -166,6 +182,7 @@ class VendorScorecardViewSet(viewsets.ModelViewSet):
     Vendor scorecard viewset supporting audited evaluation and calculation.
     Creation automatically sets evaluated_by to current authenticated user (cannot spoof evaluated_by).
     """
+
     queryset = VendorScorecard.objects.select_related(
         "vendor", "vendor__category", "evaluated_by"
     ).order_by("-created_at")
@@ -190,11 +207,15 @@ class VendorScorecardViewSet(viewsets.ModelViewSet):
                 return qs.filter(vendor_id=user.vendor_id)
             return qs.none()
 
-        vendor_id = self.request.query_params.get("vendor_id") or self.request.query_params.get("vendor")
+        vendor_id = self.request.query_params.get("vendor_id") or self.request.query_params.get(
+            "vendor"
+        )
         if vendor_id:
             qs = qs.filter(vendor_id=vendor_id)
 
-        period = self.request.query_params.get("period") or self.request.query_params.get("evaluation_period")
+        period = self.request.query_params.get("period") or self.request.query_params.get(
+            "evaluation_period"
+        )
         if period:
             qs = qs.filter(evaluation_period=period)
 
@@ -328,7 +349,12 @@ class VendorScorecardViewSet(viewsets.ModelViewSet):
             evaluated_by_user=request.user,
             comments=comments,
         )
-        return Response(VendorScorecardSerializer(scorecard).data, status=status.HTTP_201_CREATED)
+        resp_status = (
+            status.HTTP_201_CREATED
+            if getattr(scorecard, "_was_created", True)
+            else status.HTTP_200_OK
+        )
+        return Response(VendorScorecardSerializer(scorecard).data, status=resp_status)
 
 
 router = DefaultRouter()

@@ -92,12 +92,8 @@ class ApprovalPolicy(TimeStampedModel):
         related_name="multi_cc_policies",
     )
 
-    min_amount = models.DecimalField(
-        max_digits=14, decimal_places=2, default=Decimal("0.00")
-    )
-    max_amount = models.DecimalField(
-        max_digits=14, decimal_places=2, null=True, blank=True
-    )
+    min_amount = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    max_amount = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
 
     status = models.CharField(
         max_length=20, default=STATUS_ACTIVE, choices=STATUS_CHOICES, db_index=True
@@ -140,9 +136,7 @@ class ApprovalPolicy(TimeStampedModel):
         blank=True,
         related_name="+",
     )
-    exception_escalation_time_hours = models.PositiveIntegerField(
-        null=True, blank=True, default=24
-    )
+    exception_escalation_time_hours = models.PositiveIntegerField(null=True, blank=True, default=24)
     exception_routing_behavior = models.CharField(
         max_length=50,
         default="ADDITIONAL_APPROVER",
@@ -235,16 +229,25 @@ class ApprovalPolicy(TimeStampedModel):
                 self.organization = self.cost_center.department.organization
 
         super().save(*args, **kwargs)
+        from django.core.cache import cache
+
+        cache.delete(f"active_approval_policies_{self.module}")
+
+    def delete(self, *args, **kwargs):
+        from django.core.cache import cache
+
+        cache.delete(f"active_approval_policies_{self.module}")
+        super().delete(*args, **kwargs)
 
     def __str__(self):
-        curr_symbol = "₹" if self.currency == "INR" else ("$" if self.currency == "USD" else self.currency)
+        curr_symbol = (
+            "₹" if self.currency == "INR" else ("$" if self.currency == "USD" else self.currency)
+        )
         return f"{self.name} [{self.module}] (Min: {curr_symbol}{self.min_amount})"
 
 
 class ApprovalStep(TimeStampedModel):
-    policy = models.ForeignKey(
-        ApprovalPolicy, on_delete=models.CASCADE, related_name="steps"
-    )
+    policy = models.ForeignKey(ApprovalPolicy, on_delete=models.CASCADE, related_name="steps")
     step_number = models.PositiveIntegerField()
     approver_role = models.ForeignKey(
         "accounts.Role", on_delete=models.PROTECT, related_name="approval_steps"
@@ -259,9 +262,7 @@ class ApprovalStep(TimeStampedModel):
     description = models.CharField(max_length=255, blank=True)
 
     is_mandatory = models.BooleanField(default=True)
-    approval_limit = models.DecimalField(
-        max_digits=14, decimal_places=2, null=True, blank=True
-    )
+    approval_limit = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
     step_type = models.CharField(
         max_length=20,
         default="SEQUENTIAL",
@@ -283,9 +284,7 @@ class ApprovalStep(TimeStampedModel):
         unique_together = ("policy", "step_number")
 
     def __str__(self):
-        return (
-            f"Step {self.step_number}: {self.approver_role.name} for {self.policy.name}"
-        )
+        return f"Step {self.step_number}: {self.approver_role.name} for {self.policy.name}"
 
 
 class ApprovalAction(TimeStampedModel):
@@ -301,9 +300,7 @@ class ApprovalAction(TimeStampedModel):
         (ACTION_DELEGATE, "Delegated"),
     ]
 
-    policy_step = models.ForeignKey(
-        ApprovalStep, on_delete=models.SET_NULL, null=True, blank=True
-    )
+    policy_step = models.ForeignKey(ApprovalStep, on_delete=models.SET_NULL, null=True, blank=True)
     target_object_id = models.UUIDField(db_index=True)
     target_model_name = models.CharField(max_length=100)
     actor = models.ForeignKey(

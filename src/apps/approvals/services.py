@@ -2,7 +2,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from django.core.exceptions import ValidationError
-from django.db import models, transaction
+from django.db import transaction
 from django.utils import timezone
 
 from apps.accounts.models import Role, User
@@ -75,6 +75,7 @@ def create_approval_policy_service(
 
     if actor:
         from apps.audit.services import create_audit_log_service
+
         create_audit_log_service(
             actor=actor,
             action=AuditLog.ACTION_CREATE,
@@ -169,35 +170,63 @@ def evaluate_approval_chain(
     if not organization:
         if department and getattr(department, "organization", None):
             organization = department.organization
-        elif cost_center and getattr(cost_center, "department", None) and getattr(cost_center.department, "organization", None):
+        elif (
+            cost_center
+            and getattr(cost_center, "department", None)
+            and getattr(cost_center.department, "organization", None)
+        ):
             organization = cost_center.department.organization
 
-    base_qs = ApprovalPolicy.objects.filter(
-        module=module,
-        is_active=True,
-        min_amount__lte=amount,
-    ).filter(
-        models.Q(max_amount__isnull=True) | models.Q(max_amount__gte=amount)
-    ).prefetch_related("departments", "cost_centers", "steps__approver_role", "steps__specific_approver")
+    from django.core.cache import cache
 
-    if organization:
-        policies = base_qs.filter(
-            models.Q(organization=organization) | models.Q(department__organization=organization) | models.Q(organization__isnull=True, department__isnull=True)
+    cache_key = f"active_approval_policies_{module}"
+    all_module_policies = cache.get(cache_key)
+    if all_module_policies is None:
+        all_module_policies = list(
+            ApprovalPolicy.objects.filter(
+                module=module,
+                is_active=True,
+            ).prefetch_related(
+                "departments",
+                "cost_centers",
+                "steps__approver_role",
+                "steps__specific_approver",
+            )
         )
-    else:
-        policies = base_qs
+        cache.set(cache_key, all_module_policies, 60)
+
+    org_id = getattr(organization, "id", organization) if organization else None
+    policies = []
+    for p in all_module_policies:
+        if p.min_amount > amount:
+            continue
+        if p.max_amount is not None and p.max_amount < amount:
+            continue
+        if org_id:
+            p_org_id = getattr(p, "organization_id", None)
+            p_dept_org_id = (
+                getattr(p.department, "organization_id", None)
+                if getattr(p, "department", None)
+                else None
+            )
+            if (
+                p_org_id == org_id
+                or p_dept_org_id == org_id
+                or (not p_org_id and not getattr(p, "department_id", None))
+            ):
+                policies.append(p)
+        else:
+            policies.append(p)
 
     def _policy_rank(policy):
         policy_steps = sorted(policy.steps.all(), key=lambda s: s.step_number)
         has_steps = 1 if policy_steps else 0
-        first_code = (
-            getattr(policy_steps[0].approver_role, "code", "")
-            if policy_steps
-            else ""
-        )
+        first_code = getattr(policy_steps[0].approver_role, "code", "") if policy_steps else ""
         # Step-1 PROC_MGR policies cannot be actioned for PRs (PROC_MGR is read-only on Step 1)
         # unless a specific_approver is explicitly configured or no actionable fallback exists.
-        first_specific = getattr(policy_steps[0], "specific_approver_id", None) if policy_steps else None
+        first_specific = (
+            getattr(policy_steps[0], "specific_approver_id", None) if policy_steps else None
+        )
         actionable_pr = (
             1
             if (
@@ -228,7 +257,8 @@ def evaluate_approval_chain(
     # Priority 1: Organization + Department + Cost Center + Module
     if cost_center and department:
         b1 = [
-            p for p in policies
+            p
+            for p in policies
             if (p.cost_center_id == cost_center.id or cost_center in p.cost_centers.all())
             and (p.department_id == department.id or department in p.departments.all())
         ]
@@ -238,9 +268,12 @@ def evaluate_approval_chain(
     # Priority 2: Organization + Department + Module
     if not selected_policy and department:
         b2 = [
-            p for p in policies
+            p
+            for p in policies
             if (p.department_id == department.id or department in p.departments.all())
-            and p.cost_center_id is None and not p.cost_centers.exists() and not p.all_cost_centers
+            and p.cost_center_id is None
+            and not p.cost_centers.exists()
+            and not p.all_cost_centers
         ]
         fallback_candidates.extend(b2)
         selected_policy = _select_best_policy(b2)
@@ -248,9 +281,12 @@ def evaluate_approval_chain(
     # Priority 3: Organization + Cost Center + Module
     if not selected_policy and cost_center:
         b3 = [
-            p for p in policies
+            p
+            for p in policies
             if (p.cost_center_id == cost_center.id or cost_center in p.cost_centers.all())
-            and p.department_id is None and not p.departments.exists() and not p.all_departments
+            and p.department_id is None
+            and not p.departments.exists()
+            and not p.all_departments
         ]
         fallback_candidates.extend(b3)
         selected_policy = _select_best_policy(b3)
@@ -258,10 +294,13 @@ def evaluate_approval_chain(
     # Priority 4: Organization + Module (Org default / All Departments & Cost Centers)
     if not selected_policy and organization:
         b4 = [
-            p for p in policies
+            p
+            for p in policies
             if p.organization_id == organization.id
-            and p.department_id is None and not p.departments.exists()
-            and p.cost_center_id is None and not p.cost_centers.exists()
+            and p.department_id is None
+            and not p.departments.exists()
+            and p.cost_center_id is None
+            and not p.cost_centers.exists()
         ]
         fallback_candidates.extend(b4)
         selected_policy = _select_best_policy(b4)
@@ -269,9 +308,12 @@ def evaluate_approval_chain(
     # Priority 5: Global Fallback Policy
     if not selected_policy:
         b5 = [
-            p for p in policies
-            if p.department_id is None and not p.departments.exists()
-            and p.cost_center_id is None and not p.cost_centers.exists()
+            p
+            for p in policies
+            if p.department_id is None
+            and not p.departments.exists()
+            and p.cost_center_id is None
+            and not p.cost_centers.exists()
             and p.organization_id is None
         ]
         fallback_candidates.extend(b5)
@@ -291,7 +333,9 @@ def evaluate_approval_chain(
         return []
 
     steps = list(
-        selected_policy.steps.select_related("approver_role", "specific_approver").order_by("step_number")
+        selected_policy.steps.select_related("approver_role", "specific_approver").order_by(
+            "step_number"
+        )
     )
     if not steps:
         return []
@@ -323,12 +367,19 @@ def evaluate_approval_chain(
         exception_triggered = False
         reasons = []
 
-        if selected_policy.exception_amount_threshold is not None and amount >= selected_policy.exception_amount_threshold:
+        if (
+            selected_policy.exception_amount_threshold is not None
+            and amount >= selected_policy.exception_amount_threshold
+        ):
             exception_triggered = True
             curr = selected_policy.currency or "INR"
-            reasons.append(f"Amount {curr} {amount:,.2f} exceeds exception threshold ({selected_policy.exception_amount_threshold:,.2f})")
+            reasons.append(
+                f"Amount {curr} {amount:,.2f} exceeds exception threshold ({selected_policy.exception_amount_threshold:,.2f})"
+            )
 
-        if selected_policy.exception_trigger_on_missing_cost_center and (missing_cost_center or not cost_center):
+        if selected_policy.exception_trigger_on_missing_cost_center and (
+            missing_cost_center or not cost_center
+        ):
             exception_triggered = True
             reasons.append("Missing cost center mapping")
 
@@ -336,11 +387,19 @@ def evaluate_approval_chain(
             exception_triggered = True
             reasons.append("Budget overrun exception triggered")
 
-        if selected_policy.exception_department_id and department and department.id == selected_policy.exception_department_id:
+        if (
+            selected_policy.exception_department_id
+            and department
+            and department.id == selected_policy.exception_department_id
+        ):
             exception_triggered = True
             reasons.append(f"Department exception rule ({department.name})")
 
-        if selected_policy.exception_cost_center_id and cost_center and cost_center.id == selected_policy.exception_cost_center_id:
+        if (
+            selected_policy.exception_cost_center_id
+            and cost_center
+            and cost_center.id == selected_policy.exception_cost_center_id
+        ):
             exception_triggered = True
             reasons.append(f"Cost center exception rule ({cost_center.code})")
 
@@ -353,7 +412,9 @@ def evaluate_approval_chain(
                 exc_desc = f"Exception: {selected_policy.exception_reason or ', '.join(reasons)}"
                 effective_exc_user = None
                 if selected_policy.exception_specific_approver:
-                    effective_exc_user = resolve_active_delegate(selected_policy.exception_specific_approver)
+                    effective_exc_user = resolve_active_delegate(
+                        selected_policy.exception_specific_approver
+                    )
 
                 exc_step_dict = {
                     "step_number": len(chain) + 1,
@@ -381,7 +442,12 @@ def evaluate_approval_chain(
 
 
 @transaction.atomic
-def duplicate_approval_policy_service(*, policy_id: Optional[str] = None, policy: Optional[ApprovalPolicy] = None, actor: Optional[User] = None) -> ApprovalPolicy:
+def duplicate_approval_policy_service(
+    *,
+    policy_id: Optional[str] = None,
+    policy: Optional[ApprovalPolicy] = None,
+    actor: Optional[User] = None,
+) -> ApprovalPolicy:
     """
     Clones an existing approval policy into a Draft version.
     Allows easy creation of multiple amount slabs.
@@ -440,6 +506,7 @@ def duplicate_approval_policy_service(*, policy_id: Optional[str] = None, policy
 
     if actor:
         from apps.audit.services import create_audit_log_service
+
         create_audit_log_service(
             actor=actor,
             action=AuditLog.ACTION_CREATE,
@@ -453,7 +520,12 @@ def duplicate_approval_policy_service(*, policy_id: Optional[str] = None, policy
 
 
 @transaction.atomic
-def toggle_policy_status_service(*, policy_id: Optional[str] = None, policy: Optional[ApprovalPolicy] = None, actor: Optional[User] = None) -> ApprovalPolicy:
+def toggle_policy_status_service(
+    *,
+    policy_id: Optional[str] = None,
+    policy: Optional[ApprovalPolicy] = None,
+    actor: Optional[User] = None,
+) -> ApprovalPolicy:
     """
     Toggles between ACTIVE and DRAFT status.
     """
@@ -467,7 +539,9 @@ def toggle_policy_status_service(*, policy_id: Optional[str] = None, policy: Opt
     else:
         # Activate: Validate that policy has at least one approval step
         if not policy.steps.exists():
-            raise ValidationError("Cannot activate policy with zero approval steps. Add at least one approval level.")
+            raise ValidationError(
+                "Cannot activate policy with zero approval steps. Add at least one approval level."
+            )
         policy.status = ApprovalPolicy.STATUS_ACTIVE
         policy.is_active = True
         policy.full_clean()
@@ -476,6 +550,7 @@ def toggle_policy_status_service(*, policy_id: Optional[str] = None, policy: Opt
 
     if actor:
         from apps.audit.services import create_audit_log_service
+
         create_audit_log_service(
             actor=actor,
             action=AuditLog.ACTION_UPDATE,
@@ -489,7 +564,12 @@ def toggle_policy_status_service(*, policy_id: Optional[str] = None, policy: Opt
 
 
 @transaction.atomic
-def archive_policy_service(*, policy_id: Optional[str] = None, policy: Optional[ApprovalPolicy] = None, actor: Optional[User] = None) -> ApprovalPolicy:
+def archive_policy_service(
+    *,
+    policy_id: Optional[str] = None,
+    policy: Optional[ApprovalPolicy] = None,
+    actor: Optional[User] = None,
+) -> ApprovalPolicy:
     """
     Archives an approval policy.
     """
@@ -502,6 +582,7 @@ def archive_policy_service(*, policy_id: Optional[str] = None, policy: Optional[
 
     if actor:
         from apps.audit.services import create_audit_log_service
+
         create_audit_log_service(
             actor=actor,
             action=AuditLog.ACTION_UPDATE,
@@ -571,16 +652,21 @@ def set_approval_delegate_service(
     Sets up a temporary delegate for an approver.
     """
     if approver.id == delegate.id:
-        raise ValidationError("Self-delegation is prohibited: An approver cannot delegate to themselves.")
+        raise ValidationError(
+            "Self-delegation is prohibited: An approver cannot delegate to themselves."
+        )
 
-    from datetime import date, datetime
+    from datetime import datetime
+
     s_date = start_date.date() if isinstance(start_date, datetime) else start_date
     e_date = end_date.date() if isinstance(end_date, datetime) else end_date
     if isinstance(s_date, str):
         from django.utils.dateparse import parse_date
+
         s_date = parse_date(s_date)
     if isinstance(e_date, str):
         from django.utils.dateparse import parse_date
+
         e_date = parse_date(e_date)
 
     if s_date and e_date and e_date < s_date:
@@ -598,9 +684,7 @@ def set_approval_delegate_service(
 
 
 @transaction.atomic
-def process_approval_action_service(
-    *, target_object, actor: User, action: str, comments: str = ""
-):
+def process_approval_action_service(*, target_object, actor: User, action: str, comments: str = ""):
     """
     Processes an approval action (APPROVE or REJECT) on a target object (e.g. PurchaseRequisition).
     Always returns the persisted ApprovalAction record.
@@ -614,7 +698,9 @@ def process_approval_action_service(
     act_str = str(action).upper()
     valid_actions = ["APPROVE", "APPROVED", "REJECT", "REJECTED"]
     if act_str not in valid_actions:
-        raise ValidationError(f"Invalid approval action '{action}'. Valid actions are APPROVE or REJECT.")
+        raise ValidationError(
+            f"Invalid approval action '{action}'. Valid actions are APPROVE or REJECT."
+        )
 
     if isinstance(target_object, PurchaseRequisition):
         if act_str in ["APPROVE", "APPROVED"]:

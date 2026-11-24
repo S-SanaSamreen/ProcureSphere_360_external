@@ -7,7 +7,11 @@ from django.utils import timezone
 from apps.accounts.models import Role, User
 from apps.audit.models import AuditLog
 from apps.budgets.services import convert_commitment_to_actual_service
-from apps.core.validators import validate_invoice_number, validate_payment_reference, validate_resolution_notes
+from apps.core.validators import (
+    validate_invoice_number,
+    validate_payment_reference,
+    validate_resolution_notes,
+)
 from apps.orders.models import PurchaseOrder
 from apps.receipts.models import ReceiptLine
 from apps.vendors.models import Vendor
@@ -79,6 +83,22 @@ def create_supplier_invoice_service(
             f"Duplicate invoice detected: Invoice '{clean_inv_num}' already exists for vendor '{vendor.legal_name}'."
         )
 
+    if due_date:
+        import datetime
+
+        inv_d = (
+            invoice_date
+            if isinstance(invoice_date, (datetime.date, datetime.datetime))
+            else datetime.date.fromisoformat(str(invoice_date).split("T")[0])
+        )
+        due_d = (
+            due_date
+            if isinstance(due_date, (datetime.date, datetime.datetime))
+            else datetime.date.fromisoformat(str(due_date).split("T")[0])
+        )
+        if due_d < inv_d:
+            raise ValidationError("Invoice due date cannot be earlier than invoice date.")
+
     subtotal = Decimal("0.00")
     invoice = SupplierInvoice.objects.create(
         vendor=vendor,
@@ -105,6 +125,7 @@ def create_supplier_invoice_service(
                 po_line = po_line_raw
             else:
                 from apps.orders.models import POLine
+
                 try:
                     po_line = POLine.objects.filter(pk=po_line_raw, po=po).first()
                 except Exception:
@@ -114,9 +135,7 @@ def create_supplier_invoice_service(
                     f"PO line '{po_line_raw}' was not found on Purchase Order {po.po_number}."
                 )
 
-        item_desc = item.get(
-            "item_description", getattr(po_line, "item_description", "Line Item")
-        )
+        item_desc = item.get("item_description", getattr(po_line, "item_description", "Line Item"))
         try:
             qty = Decimal(str(item["quantity"]))
             unit_price = Decimal(str(item["unit_price"]))
@@ -130,29 +149,33 @@ def create_supplier_invoice_service(
                 f"Invoice line quantity for '{item_desc}' must be greater than zero. "
                 f"Negative or zero counts ({qty}) are not permitted."
             )
-        if unit_price < Decimal("0.00"):
+        if unit_price <= Decimal("0.00"):
             raise ValidationError(
-                f"Invoice line unit price for '{item_desc}' cannot be negative. "
-                f"Negative value ({unit_price}) is not permitted."
+                f"Invoice line unit price for '{item_desc}' must be greater than zero. "
+                f"Negative or zero value ({unit_price}) is not permitted."
             )
 
         if po_line:
             accepted_qty_agg = ReceiptLine.objects.filter(po_line=po_line).aggregate(
                 total_accepted=models.Sum("quantity_accepted")
             )["total_accepted"]
-            prior_invoiced_qty = (
-                InvoiceLine.objects.filter(po_line=po_line)
-                .exclude(invoice__status=SupplierInvoice.STATUS_REJECTED)
-                .exclude(invoice=invoice)
-                .aggregate(total_prior=models.Sum("quantity"))["total_prior"]
-                or Decimal("0.00")
+            prior_invoiced_qty = InvoiceLine.objects.filter(po_line=po_line).exclude(
+                invoice__status=SupplierInvoice.STATUS_REJECTED
+            ).exclude(invoice=invoice).aggregate(total_prior=models.Sum("quantity"))[
+                "total_prior"
+            ] or Decimal(
+                "0.00"
             )
             if accepted_qty_agg is not None and accepted_qty_agg > Decimal("0.00"):
                 if enforce_billable_limits and (prior_invoiced_qty + qty > accepted_qty_agg):
                     raise ValidationError(
                         f"Cumulative invoiced quantity ({prior_invoiced_qty + qty}) for '{item_desc}' would exceed accepted receipt quantity ({accepted_qty_agg})."
                     )
-            elif po_line.quantity and enforce_billable_limits and (prior_invoiced_qty + qty > po_line.quantity):
+            elif (
+                po_line.quantity
+                and enforce_billable_limits
+                and (prior_invoiced_qty + qty > po_line.quantity)
+            ):
                 raise ValidationError(
                     f"Cumulative invoiced quantity ({prior_invoiced_qty + qty}) for '{item_desc}' would exceed Purchase Order line quantity ({po_line.quantity})."
                 )
@@ -169,13 +192,9 @@ def create_supplier_invoice_service(
     tax = subtotal * tax_rate
     total = subtotal + tax
 
-    prior_invoiced_total = (
-        SupplierInvoice.objects.filter(po=po)
-        .exclude(pk=invoice.pk)
-        .exclude(status=SupplierInvoice.STATUS_REJECTED)
-        .aggregate(total=models.Sum("total_amount"))["total"]
-        or Decimal("0.00")
-    )
+    prior_invoiced_total = SupplierInvoice.objects.filter(po=po).exclude(pk=invoice.pk).exclude(
+        status=SupplierInvoice.STATUS_REJECTED
+    ).aggregate(total=models.Sum("total_amount"))["total"] or Decimal("0.00")
     if enforce_billable_limits and (prior_invoiced_total + total > po.total_amount):
         raise ValidationError(
             f"Cumulative invoiced amount (${prior_invoiced_total + total:,.2f}) would exceed Purchase Order total (${po.total_amount:,.2f})."
@@ -311,20 +330,19 @@ def run_3_way_match_service(
         )["total_accepted"] or Decimal("0.00")
 
         # Deduct prior invoiced quantities from other active/matched invoices on this PO line
-        prior_invoiced_qty = (
-            InvoiceLine.objects.filter(
-                po_line=po_line,
-                invoice__status__in=[
-                    SupplierInvoice.STATUS_MATCHING,
-                    SupplierInvoice.STATUS_EXCEPTION,
-                    SupplierInvoice.STATUS_APPROVAL,
-                    SupplierInvoice.STATUS_READY_FOR_PAYMENT,
-                    SupplierInvoice.STATUS_PAID,
-                ],
-            )
-            .exclude(invoice_id=invoice.id)
-            .aggregate(total_prior=models.Sum("quantity"))["total_prior"]
-            or Decimal("0.00")
+        prior_invoiced_qty = InvoiceLine.objects.filter(
+            po_line=po_line,
+            invoice__status__in=[
+                SupplierInvoice.STATUS_MATCHING,
+                SupplierInvoice.STATUS_EXCEPTION,
+                SupplierInvoice.STATUS_APPROVAL,
+                SupplierInvoice.STATUS_READY_FOR_PAYMENT,
+                SupplierInvoice.STATUS_PAID,
+            ],
+        ).exclude(invoice_id=invoice.id).aggregate(total_prior=models.Sum("quantity"))[
+            "total_prior"
+        ] or Decimal(
+            "0.00"
         )
 
         remaining_accepted_qty = max(Decimal("0.00"), accepted_qty_agg - prior_invoiced_qty)
@@ -388,9 +406,11 @@ def run_3_way_match_service(
 
     # 4. Record MatchResult audit record
     from apps.invoices.models import MatchResult
+
     match_user = user or invoice.created_by
     if not match_user:
         from apps.accounts.models import User
+
         match_user = User.objects.filter(is_superuser=True).first() or User.objects.first()
 
     MatchResult.objects.create(
@@ -554,8 +574,7 @@ def mark_invoice_paid_service(
 
     role_code = _get_user_role_code(user)
     if not (
-        getattr(user, "is_superuser", False)
-        or role_code in [Role.FINANCE_AP, Role.SUPER_ADMIN]
+        getattr(user, "is_superuser", False) or role_code in [Role.FINANCE_AP, Role.SUPER_ADMIN]
     ):
         raise ValidationError(
             "Permission Denied: Only Finance / AP personnel can execute invoice payments."
@@ -619,8 +638,7 @@ def approve_supplier_invoice_service(
     """
     role_code = _get_user_role_code(user)
     if not (
-        getattr(user, "is_superuser", False)
-        or role_code in [Role.FINANCE_AP, Role.SUPER_ADMIN]
+        getattr(user, "is_superuser", False) or role_code in [Role.FINANCE_AP, Role.SUPER_ADMIN]
     ):
         raise ValidationError(
             "Permission Denied: Only Finance / AP personnel can approve invoices."
@@ -636,7 +654,10 @@ def approve_supplier_invoice_service(
             f"Cannot approve invoice '{invoice.invoice_number}': Invoice is in REJECTED status."
         )
 
-    if invoice.status in [SupplierInvoice.STATUS_RECEIVED, SupplierInvoice.STATUS_VALIDATION] or not invoice.match_results.exists():
+    if (
+        invoice.status in [SupplierInvoice.STATUS_RECEIVED, SupplierInvoice.STATUS_VALIDATION]
+        or not invoice.match_results.exists()
+    ):
         raise ValidationError(
             f"Cannot approve invoice '{invoice.invoice_number}': Invoice must complete 3-way matching before approval."
         )
@@ -669,6 +690,7 @@ def approve_supplier_invoice_service(
     )
 
     from apps.notifications.models import Notification
+
     vendor_users = User.objects.filter(vendor=invoice.vendor, is_active=True)
     for vu in vendor_users:
         Notification.objects.create(
@@ -703,12 +725,9 @@ def reject_supplier_invoice_service(
 
     role_code = _get_user_role_code(user)
     if not (
-        getattr(user, "is_superuser", False)
-        or role_code in [Role.FINANCE_AP, Role.SUPER_ADMIN]
+        getattr(user, "is_superuser", False) or role_code in [Role.FINANCE_AP, Role.SUPER_ADMIN]
     ):
-        raise ValidationError(
-            "Permission Denied: Only Finance / AP personnel can reject invoices."
-        )
+        raise ValidationError("Permission Denied: Only Finance / AP personnel can reject invoices.")
 
     if invoice.status == SupplierInvoice.STATUS_PAID:
         raise ValidationError(
@@ -754,6 +773,7 @@ def reject_supplier_invoice_service(
     )
 
     from apps.notifications.models import Notification
+
     vendor_users = User.objects.filter(vendor=invoice.vendor, is_active=True)
     for vu in vendor_users:
         Notification.objects.create(
@@ -787,8 +807,7 @@ def request_invoice_correction_service(
 
     role_code = _get_user_role_code(user)
     if not (
-        getattr(user, "is_superuser", False)
-        or role_code in [Role.FINANCE_AP, Role.SUPER_ADMIN]
+        getattr(user, "is_superuser", False) or role_code in [Role.FINANCE_AP, Role.SUPER_ADMIN]
     ):
         raise ValidationError(
             "Permission Denied: Only Finance / AP personnel can request invoice corrections."
@@ -803,10 +822,10 @@ def request_invoice_correction_service(
     clean_notes = str(correction_notes).strip()
     invoice.status = SupplierInvoice.STATUS_EXCEPTION
     invoice.correction_request_notes = clean_notes
-    invoice.notes = f"{invoice.notes}\n[CORRECTION REQUESTED by {user.email}]: {clean_notes}".strip()
-    invoice.save(
-        update_fields=["status", "correction_request_notes", "notes", "updated_at"]
+    invoice.notes = (
+        f"{invoice.notes}\n[CORRECTION REQUESTED by {user.email}]: {clean_notes}".strip()
     )
+    invoice.save(update_fields=["status", "correction_request_notes", "notes", "updated_at"])
 
     AuditLog.objects.create(
         actor=user,
@@ -823,6 +842,7 @@ def request_invoice_correction_service(
     )
 
     from apps.notifications.models import Notification
+
     vendor_users = User.objects.filter(vendor=invoice.vendor, is_active=True)
     for vu in vendor_users:
         Notification.objects.create(
