@@ -344,6 +344,14 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
                                         ]
                                     }
                                 )
+                            if d_price == Decimal("0.00"):
+                                raise serializers.ValidationError(
+                                    {
+                                        "lines": [
+                                            f"Unit price must be greater than zero for line item {idx + 1}."
+                                        ]
+                                    }
+                                )
                             if d_price.as_tuple().exponent < -2:
                                 raise serializers.ValidationError(
                                     {
@@ -406,13 +414,21 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
             return po
 
     def get_vendor_risk_level(self, obj):
-        latest_risk = obj.vendor.risk_records.order_by("-created_at").first()
-        return latest_risk.risk_level if latest_risk else "LOW"
+        if hasattr(obj, "vendor") and obj.vendor:
+            cached_records = getattr(obj.vendor, "_prefetched_objects_cache", {}).get("risk_records")
+            if cached_records is not None:
+                latest = sorted(cached_records, key=lambda r: r.created_at, reverse=True)
+                return latest[0].risk_level if latest else "LOW"
+            latest_risk = obj.vendor.risk_records.order_by("-created_at").first()
+            return latest_risk.risk_level if latest_risk else "LOW"
+        return "LOW"
 
     def get_is_acknowledged(self, obj):
         return bool(obj.acknowledged_at or obj.status == PurchaseOrder.STATUS_ACKNOWLEDGED)
 
     def get_lines_count(self, obj):
+        if hasattr(obj, "_prefetched_objects_cache") and "lines" in obj._prefetched_objects_cache:
+            return len(obj._prefetched_objects_cache["lines"])
         return obj.lines.count()
 
     def get_total_quantity_ordered(self, obj):
@@ -1035,6 +1051,16 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                                 "error": {
                                     "code": "VALIDATION_ERROR",
                                     "message": f"Line {idx+1} unit price cannot be negative.",
+                                }
+                            },
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+                    if d_price == 0:
+                        return Response(
+                            {
+                                "error": {
+                                    "code": "VALIDATION_ERROR",
+                                    "message": f"Line {idx+1} unit price must be greater than zero.",
                                 }
                             },
                             status=status.HTTP_400_BAD_REQUEST,

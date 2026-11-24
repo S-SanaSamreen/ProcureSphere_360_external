@@ -382,18 +382,30 @@ def get_receipt_rejection_report(
     if po_number:
         receipt_lines = receipt_lines.filter(receipt__po__po_number__icontains=po_number)
 
+    receipt_lines_list = list(receipt_lines)
+    po_line_ids = [rl.po_line_id for rl in receipt_lines_list if rl.po_line_id]
+    po_ids = [rl.receipt.po_id for rl in receipt_lines_list if rl.receipt and rl.receipt.po_id]
+
+    schedules_by_line = {}
+    if po_line_ids:
+        for s in DeliverySchedule.objects.filter(po_line_id__in=po_line_ids):
+            schedules_by_line.setdefault(s.po_line_id, s)
+
+    schedules_by_po = {}
+    if po_ids:
+        for s in DeliverySchedule.objects.filter(po_id__in=po_ids):
+            schedules_by_po.setdefault(s.po_id, s)
+
     report_data = []
-    for rl in receipt_lines:
+    for rl in receipt_lines_list:
         line_inspection_status = rl.inspection_status
         if inspection_status and line_inspection_status != inspection_status:
             continue
 
-        # Look up delivery schedule for delivery performance calculation
-        schedule = None
-        if rl.po_line:
-            schedule = DeliverySchedule.objects.filter(po_line=rl.po_line).first()
-        if not schedule and rl.receipt.po:
-            schedule = DeliverySchedule.objects.filter(po=rl.receipt.po).first()
+        # Look up delivery schedule for delivery performance calculation (batched)
+        schedule = schedules_by_line.get(rl.po_line_id) or (
+            schedules_by_po.get(rl.receipt.po_id) if rl.receipt else None
+        )
 
         received_dt = rl.receipt.received_date
         recv_date_only = received_dt.date() if hasattr(received_dt, "date") else received_dt

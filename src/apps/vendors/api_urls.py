@@ -219,11 +219,16 @@ class VendorSerializer(serializers.ModelSerializer):
     def _cached_latest_scorecard(self, obj):
         cache = self._latest_scorecard_cache
         if obj.pk not in cache:
-            cache[obj.pk] = (
-                obj.scorecards.only("composite_score", "evaluation_period")
-                .order_by("-created_at")
-                .first()
-            )
+            if hasattr(obj, "_prefetched_objects_cache") and "scorecards" in obj._prefetched_objects_cache:
+                scorecards = obj._prefetched_objects_cache["scorecards"]
+                sorted_cards = sorted(scorecards, key=lambda c: c.created_at, reverse=True)
+                cache[obj.pk] = sorted_cards[0] if sorted_cards else None
+            else:
+                cache[obj.pk] = (
+                    obj.scorecards.only("composite_score", "evaluation_period")
+                    .order_by("-created_at")
+                    .first()
+                )
         return cache[obj.pk]
 
     def get_performance_band(self, obj):
@@ -300,36 +305,32 @@ class VendorSerializer(serializers.ModelSerializer):
         super().__init__(*args, **kwargs)
         self._latest_scorecard_cache = {}
 
-    def get_current_risk_level(self, obj):
+    def _get_latest_risk(self, obj):
+        if hasattr(obj, "_prefetched_objects_cache") and "risk_records" in obj._prefetched_objects_cache:
+            records = obj._prefetched_objects_cache["risk_records"]
+            if records:
+                sorted_recs = sorted(records, key=lambda r: r.created_at, reverse=True)
+                return sorted_recs[0]
+            return None
         records = getattr(obj, "_prefetched_risk_records", None)
         if records is not None:
-            latest = records[0] if records else None
-        else:
-            latest = obj.risk_records.order_by("-created_at").first()
+            return records[0] if records else None
+        return obj.risk_records.order_by("-created_at").first()
+
+    def get_current_risk_level(self, obj):
+        latest = self._get_latest_risk(obj)
         return latest.risk_level if latest else VendorRiskRecord.RISK_LEVEL_LOW
 
     def get_risk_assessment_notes(self, obj):
-        records = getattr(obj, "_prefetched_risk_records", None)
-        if records is not None:
-            latest = records[0] if records else None
-        else:
-            latest = obj.risk_records.order_by("-created_at").first()
+        latest = self._get_latest_risk(obj)
         return latest.assessment_notes if latest else ""
 
     def get_last_risk_assessment_date(self, obj):
-        records = getattr(obj, "_prefetched_risk_records", None)
-        if records is not None:
-            latest = records[0] if records else None
-        else:
-            latest = obj.risk_records.order_by("-created_at").first()
+        latest = self._get_latest_risk(obj)
         return latest.created_at.isoformat() if latest else None
 
     def get_last_assessed_by_email(self, obj):
-        records = getattr(obj, "_prefetched_risk_records", None)
-        if records is not None:
-            latest = records[0] if records else None
-        else:
-            latest = obj.risk_records.order_by("-created_at").first()
+        latest = self._get_latest_risk(obj)
         return latest.assessed_by.email if latest and latest.assessed_by else None
 
     def _get_all_pos(self, obj):
@@ -479,6 +480,7 @@ class VendorViewSet(viewsets.ModelViewSet):
             "risk_records",
             "risk_records__assessed_by",
             "purchase_orders",
+            "scorecards",
         )
         .order_by("-created_at")
     )
